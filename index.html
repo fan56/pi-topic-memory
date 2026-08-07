@@ -1482,7 +1482,10 @@ function applyLang(lang) {
   var els2 = document.querySelectorAll('[data-i18n-html]');
   for (i = 0; i < els2.length; i++) {
     var k2 = els2[i].getAttribute('data-i18n-html');
-    if (dict[k2] !== undefined) { els2[i].innerHTML = dict[k2]; }
+    if (dict[k2] !== undefined) {
+      var frag = new DOMParser().parseFromString(dict[k2], 'text/html').body;
+      els2[i].replaceChildren(...frag.childNodes);
+    }
   }
   var els3 = document.querySelectorAll('[data-i18n-aria]');
   for (i = 0; i < els3.length; i++) {

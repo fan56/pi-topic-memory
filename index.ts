@@ -1909,7 +1909,10 @@ async function topicDetail(
 			}
 			const ok = recordDecision(id, trimmed); // same bounded path as auto-capture
 			log(`decision-add topic=${id} source=manual`);
-			ctx.ui.notify(ok ? "Decision recorded" : "Record failed", ok ? "info" : "error");
+			ctx.ui.notify(
+				ok ? "Decision recorded" : "Record failed",
+				ok ? "info" : "error",
+			);
 			continue;
 		}
 
@@ -1924,7 +1927,10 @@ async function topicDetail(
 				topic.outcome = truncateChars(text.trim(), MAX_OUTCOME_TEXT);
 			});
 			log(`COMMAND: ${id} outcome`);
-			ctx.ui.notify(ok ? "Outcome saved" : "Save failed", ok ? "info" : "error");
+			ctx.ui.notify(
+				ok ? "Outcome saved" : "Save failed",
+				ok ? "info" : "error",
+			);
 		}
 
 		if (action === "links") {
@@ -2360,7 +2366,10 @@ const INJECT_OUTCOME_RE = /outcome=([^ ]+)/;
 const INJECT_TOPIC_RE = /topic=([^ ]+)/;
 
 /** 注入日志行 → 按 session 分组统计，按最后活动时间倒序取前 limit 个。 */
-function computeInjectStats(lines: string[], limit: number): InjectSessionStats[] {
+function computeInjectStats(
+	lines: string[],
+	limit: number,
+): InjectSessionStats[] {
 	const last = new Map<string, string>(); // session → 最后活动 ISO
 	const tries = new Map<string, number>();
 	const outcomes = new Map<string, Map<string, number>>(); // session → outcome → 计数
@@ -2521,7 +2530,9 @@ async function topicsConfigCommand(
 		];
 		const mChoice = await pickFromList(ctx, {
 			title: "topics-config → Classification Model",
-			proseLines: ["Choose the model used for topic-intent classification. Esc to exit (no save)."],
+			proseLines: [
+				"Choose the model used for topic-intent classification. Esc to exit (no save).",
+			],
 			items: modelItems,
 			preferredValue: pickedKey,
 			escHint: "exit",
@@ -2536,7 +2547,10 @@ async function topicsConfigCommand(
 				: models.find((m) => modelKey(m) === mChoice);
 		if (!picked) {
 			if (mChoice === FOLLOW_SESSION) {
-				ctx.ui.notify("Current session has no model (no session model)", "warning");
+				ctx.ui.notify(
+					"Current session has no model (no session model)",
+					"warning",
+				);
 				return;
 			}
 			continue; // model vanished between pick and resolve — re-loop
@@ -2567,7 +2581,7 @@ async function topicsConfigCommand(
 			fChoice = await pickFromList(ctx, {
 				title: "topics-config → Fallback Model",
 				proseLines: [
-					"When the primary model fails, retry in order: fallback model → session model; with \"No fallback\" no retry is performed. Esc returns to the model picker.",
+					'When the primary model fails, retry in order: fallback model → session model; with "No fallback" no retry is performed. Esc returns to the model picker.',
 				],
 				items: fallbackItems,
 				preferredValue: fChoice ?? config.fallbackModel ?? FOLLOW_SESSION,
@@ -2795,7 +2809,10 @@ async function topicsStatsCommand(
 				);
 				return;
 			}
-			ctx.ui.notify(`No topic matches "${arg}" (no id or title match)`, "warning");
+			ctx.ui.notify(
+				`No topic matches "${arg}" (no id or title match)`,
+				"warning",
+			);
 			return;
 		}
 
@@ -2828,16 +2845,16 @@ async function topicsInjectStatsCommand(
 		const lines = readFileSync(LOG_FILE, "utf-8").split(/\r?\n/);
 		const rows = computeInjectStats(lines, limit);
 		if (rows.length === 0) {
-			ctx.ui.notify(`Log is empty or has no inject records: ${LOG_FILE}`, "info");
+			ctx.ui.notify(
+				`Log is empty or has no inject records: ${LOG_FILE}`,
+				"info",
+			);
 			return;
 		}
 		// 仅当 N 行内有 injected 之外的 outcome 时才显示「其它」列
 		const showOther = rows.some((r) => r.other > 0);
 		log(`COMMAND: inject-stats n=${limit} sessions=${rows.length}`);
-		ctx.ui.notify(
-			formatInjectStatsText(rows, limit, showOther),
-			"info",
-		);
+		ctx.ui.notify(formatInjectStatsText(rows, limit, showOther), "info");
 	} catch (err) {
 		log(`ERROR: topics-inject-stats ${errMsg(err)}`);
 		ctx.ui.notify(`/topics-inject-stats error: ${errMsg(err)}`, "error");
@@ -3282,8 +3299,8 @@ export default function topicTracker(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("topics", {
-			description:
-				"Browse/update the topic ledger (status, reopen, add decisions) — global ~/.pi/agent/topic-memory.json",
+		description:
+			"Browse/update the topic ledger (status, reopen, add decisions) — global ~/.pi/agent/topic-memory.json",
 		handler: async (args, ctx) => {
 			await topicsCommand(args, ctx);
 		},

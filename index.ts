@@ -188,11 +188,11 @@ const SKIP_RE =
 const CONTINUE_RE =
 	/^\s*(?:接着做|继续做|继续|接着|搞定它|完成它|go on|continue|keep going)[。！!?.,；;]*\s*$/i;
 
-const SYSTEM_PROMPT = `你是任务意图分类器。判断用户消息是否为工作任务/需求（写代码、修 bug、升级、调研、实现功能、配置、排障等）。
-忽略纯问候/闲聊/测试消息/对上一轮的一两个字回应。
-输出严格 JSON（不要 markdown 代码块），字段：
-{"isRequirement": true|false, "type": "feature"|"bug"|"upgrade"|"refactor"|"other", "title": "≤25字的中文短标题", "summary": "一句话说明", "tags": ["1-3个关键词（技术栈/领域，如kpi、java、redis），无则空数组"]}
-规则：isRequirement=false 时 type/title/summary/tags 用 null。title 用消息的主题，不要带"请/帮我/我们"等客套前缀。`;
+const SYSTEM_PROMPT = `You are a task-intent classifier. Decide whether a user message is a work task/requirement (writing code, fixing bugs, upgrading, researching, implementing features, configuring, troubleshooting, etc.).
+Ignore pure greetings / small talk / test messages / one- or two-word replies to the previous round.
+Output strict JSON (no markdown code blocks), fields:
+{"isRequirement": true|false, "type": "feature"|"bug"|"upgrade"|"refactor"|"other", "title": "short title in the user's language, ≤25 characters", "summary": "one-sentence description", "tags": ["1-3 keywords (tech stack/domain, e.g. kpi, java, redis); empty array if none"]}
+Rules: when isRequirement=false, type/title/summary/tags are null. The title is the message's subject, without courtesy prefixes like "please" or "help me".`;
 
 const STOPWORDS = new Set([
 	"的",
@@ -282,6 +282,86 @@ interface Store {
 	version: number;
 	config: StoreConfig;
 	topics: Topic[];
+}
+
+/** Per-session runtime counters for /topics-stats --session (memory-only, never persisted). */
+interface SessionStats {
+	/** 热路径免 LLM 命中次数（输入与 active topic 相似度达标，未走 classify）。 */
+	hotPathHits: number;
+	/** LLM 分类调用次数（进入 classify 计 1；fallback 重试不额外累加）。 */
+	llmClassifies: number;
+	/** 成功注入次数（injectVerdict 实际返回注入消息的次数）。 */
+	injectedCount: number;
+	/** 注入内容总字符数（debug 短行或 silent 全卡按 content.length 累计）。 */
+	injectedChars: number;
+	/** agent_end 捕获决策次数（captureTurnDecision 调用次数）。 */
+	captureCount: number;
+}
+
+/** 全局台账统计（实时计算，不落盘）——/topics-stats 无参数用。 */
+interface GlobalStats {
+	total: number;
+	byStatus: Record<TopicStatus, number>;
+	decisionCount: number;
+	/** 平均 decisions/topic，保留 1 位小数。 */
+	avgDecisions: number;
+	/** Tag 词频 Top10（频率降序）。 */
+	tagTop: { tag: string; count: number }[];
+	/** Project 分布 Top10（频率降序）。 */
+	projectTop: { project: string; count: number }[];
+	/** 最早 firstSeen 对应日期（firstSeen 为原始输入文本，以 created 兜底），"YYYY-MM-DD" 或 null。 */
+	earliestFirstSeen: string | null;
+	/** 最近 lastUpdated 日期，"YYYY-MM-DD" 或 null。 */
+	latestLastUpdated: string | null;
+	/** topic 平均年龄（天数，取整）。 */
+	avgAgeDays: number;
+	/** links 总对数（去重后的无序对）。 */
+	linkCount: number;
+	/** 有 derivedFrom 的 topic 数。 */
+	derivedCount: number;
+	/** 沿 derivedFrom 链向上数最长的深度（层数）。 */
+	maxDeriveDepth: number;
+}
+
+/** 单 topic 详情统计——/topics-stats <id|关键词> 用。 */
+interface TopicDetail {
+	id: string;
+	title: string;
+	status: TopicStatus;
+	type: TopicType;
+	tags: string[];
+	project: string;
+	created: number;
+	lastUpdated: number;
+	decisionCount: number;
+	/** outcome 截断（≤120 字符）。 */
+	outcome: string;
+	linkCount: number;
+	/** allTopics 里 derivedFrom === 本 topic id 的数量。 */
+	childCount: number;
+	/** derivedFrom 指向的标题；无则 "-"，父 id 悬空时回退为 id 本身。 */
+	derivedFromTitle: string;
+	/** JSON.stringify(topic).length 估算体积（UTF-16 码元数）。 */
+	bytes: number;
+	/** created 到现在的存活天数（取整，≥0）。 */
+	ageDays: number;
+}
+
+/** 注入日志按 session 聚合的统计——/topics-inject-stats 用。 */
+interface InjectSessionStats {
+	session: string;
+	/** 该 session 的 inject 行总数。 */
+	tries: number;
+	/** outcome=injected 次数。 */
+	injected: number;
+	/** 其它 outcome（或缺失）次数 = tries - injected。 */
+	other: number;
+	/** 该 session 在日志中最后一条记录的时间（完整 ISO，排序键；不限 inject 行）。 */
+	lastActivity: string;
+	/** 最后活动时间展示用 "MM-DD HH:MM"（UTC）。 */
+	lastActivityDisplay: string;
+	/** 涉及的 topic id（topic=? 记为「未分类」），按首次出现顺序。 */
+	topics: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -941,16 +1021,29 @@ interface PendingInjectSlot {
 const pendingInjectSlots = new Map<string, PendingInjectSlot>();
 
 /**
- * Create a fresh slot for one input; discards any unconsumed previous slot
- * of the SAME session (its promise resolves null — the old-slot semantics
- * are kept).
+ * Slots of a PREVIOUS input, kept per session so a verdict that settles after
+ * its own round can still be consumed by the next before_agent_start
+ * (source=late). One per session — a newer leftover replaces an older one,
+ * matching the one-slot-per-session design.
+ */
+const pendingInjectLeftovers = new Map<string, PendingInjectSlot>();
+
+/**
+ * Create a fresh slot for one input. The previous unconsumed slot of the SAME
+ * session is NOT resolved to null anymore: a settled verdict is preserved as
+ * a leftover so the next before_agent_start can inject it via the late path
+ * (F1). A still-pending slot is kept too — if it settles before the next
+ * before_agent_start it remains consumable. Only a settled-null slot
+ * (classify decided not to inject) is simply discarded.
  */
 function beginPendingInject(
 	sessionId: string,
 	inputText: string,
 ): PendingInjectSlot {
 	const prev = pendingInjectSlots.get(sessionId);
-	if (prev) prev.resolve(null);
+	if (prev && !(prev.settled && prev.verdict === null)) {
+		pendingInjectLeftovers.set(sessionId, prev);
+	}
 	const slot: PendingInjectSlot = {
 		inputText,
 		createdAt: Date.now(),
@@ -972,22 +1065,31 @@ function beginPendingInject(
 }
 
 /**
- * Non-blocking consume for before_agent_start: takes the slot ONLY when its
- * verdict has already settled. A still-pending slot is LEFT in place so a
- * later turn can pick it up; beginPendingInject discards it when the next
- * input arrives. Never waits — the turn must not stall.
+ * Non-blocking consume for before_agent_start: takes a slot ONLY when its
+ * verdict has already settled. Priority: the CURRENT input's slot first
+ * (same-round injection), then a leftover from a previous input (late
+ * injection). A still-pending slot is LEFT in place so a later turn can pick
+ * it up. Never waits — the turn must not stall.
  */
 function takePendingInject(sessionId: string): {
 	slot: PendingInjectSlot;
 	verdict: PendingInject | null;
 } | null {
 	const slot = pendingInjectSlots.get(sessionId);
-	if (!slot || !slot.settled) return null;
-	pendingInjectSlots.delete(sessionId);
-	return { slot, verdict: slot.verdict };
+	if (slot && slot.settled) {
+		pendingInjectSlots.delete(sessionId);
+		return { slot, verdict: slot.verdict };
+	}
+	const leftover = pendingInjectLeftovers.get(sessionId);
+	if (leftover && leftover.settled) {
+		pendingInjectLeftovers.delete(sessionId);
+		return { slot: leftover, verdict: leftover.verdict };
+	}
+	return null;
 }
 
 /** Topics already injected this session (per session); cleared on session change. */
+// Known limitation: injectedTopics uses a single global injectedSessionKey, so switching between concurrent interactive sessions clears the other's injected set (pre-existing, not addressed here).
 const injectedTopics = new Set<string>();
 let injectedSessionKey: string | undefined;
 
@@ -1020,6 +1122,35 @@ function setActiveTopic(sessionId: string, topicId: string): void {
 		if (oldest === undefined) break;
 		activeTopicBySession.delete(oldest);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// per-session run metrics — memory-only counters for /topics-stats --session
+// ---------------------------------------------------------------------------
+
+/** 会话运行指标（内存态，不落盘）：key = sessionId，随 session_shutdown 清理。 */
+const sessionStats = new Map<string, SessionStats>();
+
+/**
+ * Bump one session counter (default +1; pass a delta for char/byte sums).
+ * Missing entry is initialized to zeros — callers never need to pre-create.
+ * No session id → no-op (the counter cannot be attributed to any session).
+ */
+function bumpSessionStat(
+	sessionId: string,
+	key: keyof SessionStats,
+	delta = 1,
+): void {
+	if (!sessionId) return;
+	const s = sessionStats.get(sessionId) ?? {
+		hotPathHits: 0,
+		llmClassifies: 0,
+		injectedCount: 0,
+		injectedChars: 0,
+		captureCount: 0,
+	};
+	s[key] += delta;
+	sessionStats.set(sessionId, s);
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,11 +1229,11 @@ function flushPendingCapture(
 	captureTextForTopic(ctx, topicId, pending.text, { delayed: true });
 }
 
-const STATUS_CN: Record<TopicStatus, string> = {
-	in_progress: "进行中",
-	blocked: "阻塞",
-	done: "已完成",
-	dropped: "已放弃",
+const STATUS_LABEL: Record<TopicStatus, string> = {
+	in_progress: "In progress",
+	blocked: "Blocked",
+	done: "Done",
+	dropped: "Dropped",
 };
 
 /** First line only, whitespace collapsed, truncated to ≤ max visible width. */
@@ -1172,20 +1303,20 @@ function summarySegment(raw: string): string {
 function buildInjectCard(t: Topic, config: StoreConfig): string {
 	const lines: string[] = [];
 	lines.push(`pi-topic-mem inject: ${t.title}`);
-	lines.push(`状态: ${STATUS_CHAR[t.status]} ${STATUS_CN[t.status]}`);
-	lines.push(`更新: ${relTime(t.lastUpdated)}`);
+	lines.push(`Status: ${STATUS_CHAR[t.status]} ${STATUS_LABEL[t.status]}`);
+	lines.push(`Updated: ${relTime(t.lastUpdated)}`);
 	if (config.model || config.thinking) {
 		const parts: string[] = [];
-		if (config.model) parts.push(`模型 ${config.model}`);
+		if (config.model) parts.push(`Model: ${config.model}`);
 		if (config.thinking) parts.push(`think ${config.thinking}`);
-		lines.push(`分类: ${parts.join(" · ")}`);
+		lines.push(parts.join(" · "));
 	}
 	const recent = t.decisions.slice(-INJECT_MAX_DECISIONS);
 	if (recent.length > 0) {
-		lines.push(`决策:`);
+		lines.push(`Decisions:`);
 		for (const d of recent) lines.push(`  • ${oneLine(d.text, 100)}`);
 	}
-	if (t.outcome) lines.push(`结论: ${flattenText(t.outcome, 100)}`);
+	if (t.outcome) lines.push(`Outcome: ${flattenText(t.outcome, 100)}`);
 	return lines.join("\n");
 }
 
@@ -1263,6 +1394,7 @@ function handleInput(text: string, ctx: ExtensionContext): void {
 						matchScore(hotTokens, hotCached.source),
 					);
 					if (hotScore >= MATCH_THRESHOLD) {
+						bumpSessionStat(sessionId, "hotPathHits"); // 热路径免 LLM 命中
 						hotTopic.lastUpdated = Date.now();
 						saveStore(hotStore);
 						log(`HOT-PATH: ${hotTopic.id} (${hotScore.toFixed(2)})`);
@@ -1305,6 +1437,7 @@ function handleInput(text: string, ctx: ExtensionContext): void {
 			};
 			let resp: AssistantMessage | undefined;
 			let usedModel = classifyModel;
+			bumpSessionStat(sessionId, "llmClassifies"); // 进入 classify 计 1（fallback 重试不额外累加）
 			try {
 				resp = await mr.completeSimple(classifyModel, callPayload, opts);
 			} catch (err) {
@@ -1410,7 +1543,7 @@ function handleInput(text: string, ctx: ExtensionContext): void {
 			}
 			if (best !== undefined && best.score >= MATCH_THRESHOLD) {
 				best.topic.lastUpdated = Date.now();
-				appendDecision(best.topic, `收到新进展/新需求：${summary}`);
+				appendDecision(best.topic, `New progress/request: ${summary}`);
 				// tags 合并：新 tag 并入既有集（去重、上限 3），无变化不写
 				if (tags.length > 0) {
 					const merged = [...new Set([...best.topic.tags, ...tags])].slice(
@@ -1583,7 +1716,7 @@ function pickFromList(
 				out.push(
 					theme.fg(
 						"muted",
-						`↑↓ 导航  键入过滤${query ? ` "${query}"` : ""}  ⌫ 清除  Enter 选择  Esc ${esc}`,
+						`↑↓ Navigate   Type to filter${query ? ` "${query}"` : ""}  ⌫ Clear  Enter Select  Esc ${esc}`,
 					),
 				);
 				return out;
@@ -1629,12 +1762,12 @@ function fmtDate(ts: number): string {
 function relTime(ts: number): string {
 	const diff = Date.now() - ts;
 	const m = Math.floor(diff / 60000);
-	if (m < 1) return "刚刚";
-	if (m < 60) return `${m}分钟前`;
+	if (m < 1) return "just now";
+	if (m < 60) return `${m}m ago`;
 	const h = Math.floor(m / 60);
-	if (h < 24) return `${h}小时前`;
+	if (h < 24) return `${h}h ago`;
 	const d = Math.floor(h / 24);
-	if (d < 30) return `${d}天前`;
+	if (d < 30) return `${d}d ago`;
 	return new Date(ts).toISOString().slice(0, 10);
 }
 
@@ -1656,7 +1789,7 @@ function describeTopic(t: Topic): string[] {
 	const recent = t.decisions.slice(-5);
 	lines.push(`decisions (${t.decisions.length}/${MAX_DECISIONS_PER_TOPIC}):`);
 	for (const d of recent) lines.push(`  • ${fmtDate(d.at)} ${d.text}`);
-	if (t.decisions.length > 5) lines.push(`  … 共 ${t.decisions.length} 条`);
+	if (t.decisions.length > 5) lines.push(`  … ${t.decisions.length} total`);
 	return lines;
 }
 
@@ -1717,19 +1850,19 @@ async function topicDetail(
 		const store = loadStore();
 		const t = store.topics.find((x) => x.id === id);
 		if (!t) {
-			ctx.ui.notify(`topic ${id} 不存在`, "warning");
+			ctx.ui.notify(`Topic ${id} does not exist`, "warning");
 			return true;
 		}
 		const action = await pickFromList(ctx, {
 			title: `topic: ${t.id}`,
 			proseLines: describeTopic(t),
 			items: [
-				{ value: "status", label: "改状态", check: false },
-				{ value: "decision", label: "记录决策", check: false },
-				{ value: "outcome", label: "写结论", check: false },
-				{ value: "links", label: "关联 topic", check: false },
-				{ value: "delete", label: "删除 topic", check: false },
-				{ value: "back", label: "返回", check: false },
+				{ value: "status", label: "Change status", check: false },
+				{ value: "decision", label: "Record decision", check: false },
+				{ value: "outcome", label: "Set outcome", check: false },
+				{ value: "links", label: "Link topics", check: false },
+				{ value: "delete", label: "Delete topic", check: false },
+				{ value: "back", label: "Back", check: false },
 			],
 			escHint: "back",
 		});
@@ -1737,8 +1870,8 @@ async function topicDetail(
 
 		if (action === "status") {
 			const st = await pickFromList(ctx, {
-				title: "改状态",
-				proseLines: [`当前状态: ${STATUS_CHAR[t.status]} ${t.status}`],
+				title: "Change Status",
+				proseLines: [`Current status: ${STATUS_CHAR[t.status]} ${t.status}`],
 				items: STATUS_ITEMS,
 				preferredValue: t.status,
 				escHint: "back",
@@ -1752,12 +1885,12 @@ async function topicDetail(
 					(prev.status === "done" || prev.status === "dropped")
 				) {
 					// reopen: keep outcome, record the reopen decision
-					appendDecision(topic, "重新打开");
+					appendDecision(topic, "Reopened");
 				}
 			});
 			log(`COMMAND: ${id} status=${st}`);
 			ctx.ui.notify(
-				ok ? `状态已更新为 ${st}` : `更新失败`,
+				ok ? `Status updated to ${st}` : "Update failed",
 				ok ? "info" : "error",
 			);
 			continue;
@@ -1765,25 +1898,25 @@ async function topicDetail(
 
 		if (action === "decision") {
 			const text = await ctx.ui.input(
-				"记录决策",
-				"记录一条决策…（Enter 确认，Esc 取消）",
+				"Record Decision",
+				"Enter a decision… (Enter to confirm, Esc to cancel)",
 			);
 			if (text == null) continue;
 			const trimmed = text.trim();
 			if (!trimmed) {
-				ctx.ui.notify("决策内容为空", "warning");
+				ctx.ui.notify("Decision text is empty", "warning");
 				continue;
 			}
 			const ok = recordDecision(id, trimmed); // same bounded path as auto-capture
 			log(`decision-add topic=${id} source=manual`);
-			ctx.ui.notify(ok ? "决策已记录" : "记录失败", ok ? "info" : "error");
+			ctx.ui.notify(ok ? "Decision recorded" : "Record failed", ok ? "info" : "error");
 			continue;
 		}
 
 		if (action === "outcome") {
 			const text = await ctx.ui.input(
-				"写结论",
-				`当前结论: ${t.outcome || "（无）"}\n输入结论内容（Enter 确认，Esc 取消）`,
+				"Set Outcome",
+				`Current outcome: ${t.outcome || "(none)"}\nEnter outcome text (Enter to confirm, Esc to cancel)`,
 			);
 			if (text == null) continue;
 			const ok = mutateTopic(id, (topic) => {
@@ -1791,7 +1924,7 @@ async function topicDetail(
 				topic.outcome = truncateChars(text.trim(), MAX_OUTCOME_TEXT);
 			});
 			log(`COMMAND: ${id} outcome`);
-			ctx.ui.notify(ok ? "结论已保存" : "保存失败", ok ? "info" : "error");
+			ctx.ui.notify(ok ? "Outcome saved" : "Save failed", ok ? "info" : "error");
 		}
 
 		if (action === "links") {
@@ -1799,7 +1932,7 @@ async function topicDetail(
 				const store2 = loadStore();
 				const t2 = store2.topics.find((x) => x.id === id);
 				if (!t2) {
-					ctx.ui.notify(`topic ${id} 不存在`, "warning");
+					ctx.ui.notify(`Topic ${id} does not exist`, "warning");
 					break;
 				}
 				const linkItems: PickerItem[] = [
@@ -1807,12 +1940,12 @@ async function topicDetail(
 						const lt = store2.topics.find((x) => x.id === lid);
 						return {
 							value: lid,
-							label: `解除: ${lt ? lt.title : lid}`,
+							label: `Unlink: ${lt ? lt.title : lid}`,
 							check: false,
 						};
 					}),
-					{ value: "__add__", label: "＋ 添加关联…", check: false },
-					{ value: "back", label: "返回", check: false },
+					{ value: "__add__", label: "+ Add link…", check: false },
+					{ value: "back", label: "Back", check: false },
 				];
 				const choice2 = await pickFromList(ctx, {
 					title: `links (${t2.links.length})`,
@@ -1822,7 +1955,7 @@ async function topicDetail(
 									const lt = store2.topics.find((x) => x.id === lid);
 									return `${lt ? lt.title : lid} (${lid})`;
 								})
-							: ["（无关联 topic）"],
+							: ["(no linked topics)"],
 					items: linkItems,
 					escHint: "back",
 				});
@@ -1836,11 +1969,11 @@ async function topicDetail(
 							check: false,
 						}));
 					if (candidates.length === 0) {
-						ctx.ui.notify("没有可关联的 topic", "info");
+						ctx.ui.notify("No topics available to link", "info");
 						continue;
 					}
 					const target = await pickFromList(ctx, {
-						title: "选择要关联的 topic",
+						title: "Select Topic to Link",
 						proseLines: [],
 						items: candidates,
 						escHint: "back",
@@ -1848,14 +1981,14 @@ async function topicDetail(
 					if (target == null) continue;
 					const ok = linkTopics(id, target);
 					ctx.ui.notify(
-						ok ? `已关联 ${target}` : "关联失败",
+						ok ? `Linked ${target}` : "Link failed",
 						ok ? "info" : "error",
 					);
 					continue;
 				}
 				const ok = unlinkTopics(id, choice2);
 				ctx.ui.notify(
-					ok ? `已解除 ${choice2}` : "解除失败",
+					ok ? `Unlinked ${choice2}` : "Unlink failed",
 					ok ? "info" : "error",
 				);
 			}
@@ -1864,14 +1997,14 @@ async function topicDetail(
 		if (action === "delete") {
 			// 单次确认（全删走列表底部 double confirm 入口）
 			const cf = await pickFromList(ctx, {
-				title: "删除确认",
+				title: "Delete Confirmation",
 				proseLines: [
-					`确定删除 topic「${t.title}」（${t.id}）？`,
-					"其他 topic 对它的关联引用将被同步清理。",
+					`Delete topic "${t.title}" (${t.id})?`,
+					"References from other topics to it will be cleaned up.",
 				],
 				items: [
-					{ value: "yes", label: "删除", check: false },
-					{ value: "back", label: "取消", check: false },
+					{ value: "yes", label: "Delete", check: false },
+					{ value: "back", label: "Cancel", check: false },
 				],
 				preferredValue: "back",
 				escHint: "back",
@@ -1879,7 +2012,7 @@ async function topicDetail(
 			if (cf !== "yes") continue;
 			const ok = deleteTopic(id);
 			log(`COMMAND: ${id} deleted`);
-			ctx.ui.notify(ok ? "已删除" : "删除失败", ok ? "info" : "error");
+			ctx.ui.notify(ok ? "Deleted" : "Delete failed", ok ? "info" : "error");
 			return false; // 已删除——退出 /topics（避免回到列表选中不存在的 id）
 		}
 	}
@@ -1890,7 +2023,7 @@ async function topicsCommand(
 	ctx: ExtensionContext,
 ): Promise<void> {
 	if (!ctx.hasUI) {
-		ctx.ui.notify("/topics 需要交互式界面", "warning");
+		ctx.ui.notify("/topics requires an interactive UI", "warning");
 		return;
 	}
 	log("COMMAND: open");
@@ -1926,19 +2059,19 @@ async function topicsCommand(
 			})),
 		{
 			value: INJECT_TOGGLE,
-			label: `注入显示: ${store.config.injectDisplay}（点击切换）`,
+			label: `Inject display: ${store.config.injectDisplay} (click to toggle)`,
 			check: false,
 		},
 		{
 			value: DISTILL_TOGGLE,
-			label: `蒸馏: ${store.config.llmDistill ? "on" : "off"}（点击切换）`,
+			label: `Distill: ${store.config.llmDistill ? "on" : "off"} (click to toggle)`,
 			check: false,
 		},
 		...(store.topics.length > 0
 			? [
 					{
 						value: CLEAR_ALL,
-						label: `清除全部 topic（${store.topics.length}）`,
+						label: `Clear all topics (${store.topics.length})`,
 						check: false,
 					},
 				]
@@ -1956,7 +2089,7 @@ async function topicsCommand(
 				i.value !== CLEAR_ALL,
 		).length;
 		if (matchedCount === 0 && filter) {
-			ctx.ui.notify(`没有匹配 "${filter}" 的 topic`, "info");
+			ctx.ui.notify(`No topics match "${filter}"`, "info");
 			return;
 		}
 		const choice = await pickFromList(ctx, {
@@ -1965,10 +2098,10 @@ async function topicsCommand(
 			// (INJECT_TOGGLE row) stays reachable for fresh installs (F4).
 			proseLines:
 				store.topics.length === 0
-					? ["（暂无 topic）——先给 agent 发一条工作消息试试"]
+					? ["(no topics yet) — send the agent a work message to create one"]
 					: filter
-						? [`过滤: "${filter}"`]
-						: ["选择 topic 查看详情，Esc 退出。"],
+						? [`Filter: "${filter}"`]
+						: ["Select a topic for details, Esc to exit."],
 			items,
 			preferredValue: preselect,
 			escHint: "exit",
@@ -1979,7 +2112,7 @@ async function topicsCommand(
 			const ok = saveInjectDisplay(next);
 			log(`COMMAND: injectDisplay=${next}`);
 			ctx.ui.notify(
-				ok ? `注入显示已切换为 ${next}` : "切换失败",
+				ok ? `Inject display switched to ${next}` : "Toggle failed",
 				ok ? "info" : "error",
 			);
 			store = loadStore();
@@ -1990,7 +2123,7 @@ async function topicsCommand(
 			const ok = saveDistill(next);
 			log(`COMMAND: llmDistill=${next}`);
 			ctx.ui.notify(
-				ok ? `蒸馏已切换为 ${next ? "on" : "off"}` : "切换失败",
+				ok ? `Distill switched to ${next ? "on" : "off"}` : "Toggle failed",
 				ok ? "info" : "error",
 			);
 			store = loadStore();
@@ -1999,14 +2132,14 @@ async function topicsCommand(
 		if (choice === CLEAR_ALL) {
 			// double confirm：先点入口行，再弹确认 picker，选「全部清除」才执行
 			const cf = await pickFromList(ctx, {
-				title: "清除全部 topic",
+				title: "Clear All Topics",
 				proseLines: [
-					`将删除全部 ${store.topics.length} 个 topic（config 保留）。`,
-					"此操作不可撤销。",
+					`This will delete all ${store.topics.length} topics (config is kept).`,
+					"This cannot be undone.",
 				],
 				items: [
-					{ value: "yes", label: "全部清除", check: false },
-					{ value: "back", label: "取消", check: false },
+					{ value: "yes", label: "Clear All", check: false },
+					{ value: "back", label: "Cancel", check: false },
 				],
 				preferredValue: "back",
 				escHint: "back",
@@ -2015,7 +2148,7 @@ async function topicsCommand(
 			const ok = clearTopics();
 			log(`COMMAND: clear-all (${store.topics.length} topics)`);
 			ctx.ui.notify(
-				ok ? "已清除全部 topic" : "清除失败",
+				ok ? "Cleared all topics" : "Clear failed",
 				ok ? "info" : "error",
 			);
 			store = loadStore();
@@ -2039,6 +2172,311 @@ function sortedTopics(store: Store): Topic[] {
 }
 
 // ---------------------------------------------------------------------------
+// /topics-stats — pure compute + text formatting (no IO, no persistence)
+// ---------------------------------------------------------------------------
+
+/** Timestamp → "YYYY-MM-DD"; non-finite/zero → null (stats render as "—"). */
+function isoDay(ts: number | undefined): string | null {
+	if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) return null;
+	return new Date(ts).toISOString().slice(0, 10);
+}
+
+/**
+ * Real-time global ledger stats over the CURRENT store (nothing persisted).
+ * - Tag / project distributions are frequency-desc lists capped at 10.
+ * - source.firstSeen is the raw input TEXT (not a timestamp) — the earliest
+ *   date stat therefore uses `created` as the first-seen proxy.
+ * - linkCount counts unique unordered pairs (links are written
+ *   bidirectionally, so summing raw lengths would double-count).
+ * - Max derive depth walks each derivedFrom chain upward; a cycle
+ *   (pathological data) stops counting at the loop instead of recursing.
+ * Empty store: all-zero distributions, null dates, zero averages.
+ */
+function computeGlobalStats(topics: Topic[]): GlobalStats {
+	const byStatus: Record<TopicStatus, number> = {
+		in_progress: 0,
+		done: 0,
+		blocked: 0,
+		dropped: 0,
+	};
+	const tagCount = new Map<string, number>();
+	const projectCount = new Map<string, number>();
+	const linkPairs = new Set<string>();
+	const parentOf = new Map(
+		topics.map((t): [string, string] => [t.id, t.derivedFrom]),
+	);
+	const depthOf = new Map<string, number>();
+	const visiting = new Set<string>();
+	const deriveDepth = (id: string): number => {
+		const cached = depthOf.get(id);
+		if (cached !== undefined) return cached;
+		if (visiting.has(id)) return 0; // cycle — stop at the loop
+		visiting.add(id);
+		const parent = parentOf.get(id);
+		const d = parent ? 1 + deriveDepth(parent) : 0;
+		visiting.delete(id);
+		depthOf.set(id, d);
+		return d;
+	};
+
+	let decisionCount = 0;
+	let derivedCount = 0;
+	let earliest: number | null = null;
+	let latest: number | null = null;
+	let ageSum = 0;
+	let maxDeriveDepth = 0;
+	const now = Date.now();
+
+	for (const t of topics) {
+		byStatus[t.status] += 1;
+		decisionCount += t.decisions.length;
+		if (t.derivedFrom) derivedCount += 1;
+		if (t.project)
+			projectCount.set(t.project, (projectCount.get(t.project) ?? 0) + 1);
+		for (const tag of t.tags) tagCount.set(tag, (tagCount.get(tag) ?? 0) + 1);
+		for (const l of t.links) {
+			linkPairs.add(t.id < l ? `${t.id}|${l}` : `${l}|${t.id}`);
+		}
+		if (earliest === null || t.created < earliest) earliest = t.created;
+		if (latest === null || t.lastUpdated > latest) latest = t.lastUpdated;
+		ageSum += now - t.created;
+		maxDeriveDepth = Math.max(maxDeriveDepth, deriveDepth(t.id));
+	}
+
+	const total = topics.length;
+	const tagTop = [...tagCount.entries()]
+		.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+		.slice(0, 10)
+		.map(([tag, count]) => ({ tag, count }));
+	const projectTop = [...projectCount.entries()]
+		.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+		.slice(0, 10)
+		.map(([project, count]) => ({ project, count }));
+
+	return {
+		total,
+		byStatus,
+		decisionCount,
+		avgDecisions: total > 0 ? Math.round((decisionCount / total) * 10) / 10 : 0,
+		tagTop,
+		projectTop,
+		earliestFirstSeen: isoDay(earliest ?? undefined),
+		latestLastUpdated: isoDay(latest ?? undefined),
+		avgAgeDays:
+			total > 0 ? Math.max(0, Math.round(ageSum / total / 86_400_000)) : 0,
+		linkCount: linkPairs.size,
+		derivedCount,
+		maxDeriveDepth,
+	};
+}
+
+/**
+ * One topic's detail stats. `allTopics` supplies the child count and the
+ * derivedFrom title resolution; both derive from the CURRENT store snapshot.
+ */
+function computeTopicDetail(topic: Topic, allTopics: Topic[]): TopicDetail {
+	return {
+		id: topic.id,
+		title: topic.title,
+		status: topic.status,
+		type: topic.type,
+		tags: [...topic.tags],
+		project: topic.project,
+		created: topic.created,
+		lastUpdated: topic.lastUpdated,
+		decisionCount: topic.decisions.length,
+		outcome: topic.outcome ? truncateChars(topic.outcome, 120) : "",
+		linkCount: topic.links.length,
+		childCount: allTopics.filter((t) => t.derivedFrom === topic.id).length,
+		// 父 id 悬空（被删）时回退为 id 本身，仍比 "-" 更有信息量
+		derivedFromTitle: topic.derivedFrom
+			? (allTopics.find((t) => t.id === topic.derivedFrom)?.title ??
+				topic.derivedFrom)
+			: "-",
+		bytes: JSON.stringify(topic).length,
+		ageDays: Math.max(0, Math.round((Date.now() - topic.created) / 86_400_000)),
+	};
+}
+
+/** 全局统计 → 对齐纯文本（中文标签，空格补列）。 */
+function formatGlobalStatsText(s: GlobalStats): string {
+	const lines = [
+		`📊 Global Ledger Stats (${s.total} topics)`,
+		`  Status: ▶In progress ${s.byStatus.in_progress}  ✓Done ${s.byStatus.done}  ⏸Blocked ${s.byStatus.blocked}  ✕Dropped ${s.byStatus.dropped}`,
+		`  Decisions: ${s.decisionCount} total, avg ${s.avgDecisions.toFixed(1)}/topic`,
+		`  Time: earliest ${s.earliestFirstSeen ?? "—"}   last updated ${s.latestLastUpdated ?? "—"}   avg age ${s.avgAgeDays} days`,
+		`  Relations: ${s.linkCount} links   ${s.derivedCount} derived   deepest chain ${s.maxDeriveDepth} levels`,
+		``,
+		`  Tag Frequency Top${s.tagTop.length}:`,
+	];
+	if (s.tagTop.length === 0) lines.push("    —");
+	for (const { tag, count } of s.tagTop)
+		lines.push(`    ${padToWidth(tag, 16)} ${count}`);
+	lines.push(`  Project Distribution Top${s.projectTop.length}:`);
+	if (s.projectTop.length === 0) lines.push("    —");
+	for (const { project, count } of s.projectTop)
+		lines.push(`    ${padToWidth(project, 24)} ${count}`);
+	return lines.join("\n");
+}
+
+/** 单 topic 详情 → 对齐纯文本（参考 describeTopic 的键值风格）。 */
+function formatTopicDetailText(d: TopicDetail): string {
+	const lines = [
+		`📌 ${d.title}`,
+		`  id: ${d.id}`,
+		`  status: ${STATUS_CHAR[d.status]} ${d.status}    type: ${d.type}`,
+		`  project: ${d.project || "—"}`,
+		`  tags: ${d.tags.length > 0 ? d.tags.join(", ") : "—"}`,
+		`  created: ${fmtDate(d.created)}    age ${d.ageDays} days`,
+		`  lastUpdated: ${fmtDate(d.lastUpdated)}`,
+		`  decisions: ${d.decisionCount}`,
+		`  outcome: ${d.outcome ? truncateToWidth(d.outcome, 80) : "—"}`,
+		`  links: ${d.linkCount}    children: ${d.childCount}    derived from: ${truncateToWidth(d.derivedFromTitle, 40)}`,
+		`  size: ${d.bytes} bytes`,
+	];
+	return lines.join("\n");
+}
+
+/** 会话运行指标 → 对齐纯文本（中文标签）。 */
+function formatSessionStatsText(sessionId: string, s: SessionStats): string {
+	return [
+		`🖥 Session Run Metrics (session ${sessionId || "?"})`,
+		`  Hot-path hits: ${s.hotPathHits} (no LLM)`,
+		`  LLM classifies: ${s.llmClassifies}`,
+		`  Injections: ${s.injectedCount}, ${s.injectedChars} chars`,
+		`  Decisions captured: ${s.captureCount}`,
+	].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// /topics-inject-stats — parse LOG_FILE → per-session inject stats
+// (语义：任意含 session= 的行更新最后活动时间，
+// 仅 inject 行累计统计；topic=? 记为「未分类」)
+// ---------------------------------------------------------------------------
+
+const INJECT_TS_RE = /^\[([^\]]+)\]/;
+const INJECT_SESSION_RE = /session=([^ ]+)/;
+const INJECT_OUTCOME_RE = /outcome=([^ ]+)/;
+const INJECT_TOPIC_RE = /topic=([^ ]+)/;
+
+/** 注入日志行 → 按 session 分组统计，按最后活动时间倒序取前 limit 个。 */
+function computeInjectStats(lines: string[], limit: number): InjectSessionStats[] {
+	const last = new Map<string, string>(); // session → 最后活动 ISO
+	const tries = new Map<string, number>();
+	const outcomes = new Map<string, Map<string, number>>(); // session → outcome → 计数
+	const topics = new Map<string, Map<string, number>>(); // session → topic → 占位（保序去重）
+
+	for (const line of lines) {
+		const tsMatch = INJECT_TS_RE.exec(line);
+		if (!tsMatch) continue;
+		const ts = tsMatch[1];
+		const sessMatch = INJECT_SESSION_RE.exec(line);
+		const sess = sessMatch ? sessMatch[1] : "";
+		// 任意含 session= 的行都刷新该 session 的最后活动时间
+		if (sess) last.set(sess, ts);
+		// 仅含 inject 标记行累计统计
+		if (!line.includes(" inject ") || !sess) continue;
+		tries.set(sess, (tries.get(sess) ?? 0) + 1);
+		const outMatch = INJECT_OUTCOME_RE.exec(line);
+		const o = outMatch ? outMatch[1] : "?";
+		let oc = outcomes.get(sess);
+		if (!oc) {
+			oc = new Map();
+			outcomes.set(sess, oc);
+		}
+		oc.set(o, (oc.get(o) ?? 0) + 1);
+		const topMatch = INJECT_TOPIC_RE.exec(line);
+		const rawTopic = topMatch ? topMatch[1] : "?";
+		const t = rawTopic === "?" ? "unclassified" : rawTopic;
+		let tc = topics.get(sess);
+		if (!tc) {
+			tc = new Map();
+			topics.set(sess, tc);
+		}
+		tc.set(t, 0); // 仅用于保序去重
+	}
+
+	const rows: InjectSessionStats[] = [];
+	for (const [sess, tr] of tries) {
+		const oc = outcomes.get(sess) ?? new Map();
+		const injected = oc.get("injected") ?? 0;
+		const lastTs = last.get(sess) ?? "";
+		rows.push({
+			session: sess,
+			tries: tr,
+			injected,
+			other: tr - injected,
+			lastActivity: lastTs,
+			lastActivityDisplay: lastTs
+				? `${lastTs.slice(5, 10)} ${lastTs.slice(11, 16)}`
+				: "",
+			topics: [...(topics.get(sess)?.keys() ?? [])],
+		});
+	}
+	rows.sort((a, b) => {
+		if (a.lastActivity > b.lastActivity) return -1;
+		if (a.lastActivity < b.lastActivity) return 1;
+		return 0;
+	});
+	return rows.slice(0, limit);
+}
+
+/** -n 参数解析：正整数，非法回退默认 10（支持 `-n 3` 与 `-n3` 两种写法）。 */
+function parseInjectStatsLimit(args: string): number {
+	const tokens = (args ?? "")
+		.trim()
+		.split(/\s+/)
+		.filter((t) => t.length > 0);
+	for (let i = 0; i < tokens.length; i++) {
+		const t = tokens[i];
+		let val: string | null = null;
+		if (t === "-n" && i + 1 < tokens.length) val = tokens[i + 1];
+		else if (/^-n\d+$/.test(t)) val = t.slice(2);
+		if (val !== null && /^\d+$/.test(val) && Number(val) >= 1) {
+			return Number(val);
+		}
+	}
+	return 10;
+}
+
+/** 注入统计 → 对齐纯文本表格（中文表头；「其它」列仅在存在时显示）。 */
+function formatInjectStatsText(
+	rows: InjectSessionStats[],
+	limit: number,
+	showOther: boolean,
+): string {
+	const padL = (s: string, w: number) =>
+		" ".repeat(Math.max(0, w - visibleWidth(s))) + s;
+	const lines: string[] = [
+		`📊 Inject Stats — latest ${limit} sessions (by last activity, desc)`,
+	];
+	if (showOther) {
+		lines.push(
+			`  ${padToWidth("session", 36)}${padL("attempts", 8)}${padL("injected", 9)}${padL("other", 6)}  ${padToWidth("last-activity", 13)} topics`,
+		);
+		lines.push(
+			`  ${"-".repeat(36)}${"-".repeat(8)}${"-".repeat(9)}${"-".repeat(6)}  ${"-".repeat(13)} ------`,
+		);
+		for (const r of rows)
+			lines.push(
+				`  ${padToWidth(r.session, 36)}${padL(String(r.tries), 8)}${padL(String(r.injected), 9)}${padL(String(r.other), 6)}  ${padToWidth(r.lastActivityDisplay, 13)} ${r.topics.join(",")}`,
+			);
+	} else {
+		lines.push(
+			`  ${padToWidth("session", 36)}${padL("attempts", 8)}${padL("injected", 9)}  ${padToWidth("last-activity", 13)} topics`,
+		);
+		lines.push(
+			`  ${"-".repeat(36)}${"-".repeat(8)}${"-".repeat(9)}  ${"-".repeat(13)} ------`,
+		);
+		for (const r of rows)
+			lines.push(
+				`  ${padToWidth(r.session, 36)}${padL(String(r.tries), 8)}${padL(String(r.injected), 9)}  ${padToWidth(r.lastActivityDisplay, 13)} ${r.topics.join(",")}`,
+			);
+	}
+	return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // /topics-config command — model + thinking cascade (picker pattern from fun-agent)
 // ---------------------------------------------------------------------------
 
@@ -2049,7 +2487,7 @@ async function topicsConfigCommand(
 	ctx: ExtensionContext,
 ): Promise<void> {
 	if (!ctx.hasUI) {
-		ctx.ui.notify("/topics-config 需要交互式界面", "warning");
+		ctx.ui.notify("/topics-config requires an interactive UI", "warning");
 		return;
 	}
 	let models: Model<Api>[] = [];
@@ -2059,7 +2497,7 @@ async function topicsConfigCommand(
 		models = [];
 	}
 	if (models.length === 0) {
-		ctx.ui.notify("没有可用模型（getAvailable 为空/出错）", "warning");
+		ctx.ui.notify("No available models (getAvailable empty/error)", "warning");
 		return;
 	}
 
@@ -2072,7 +2510,7 @@ async function topicsConfigCommand(
 		const modelItems: PickerItem[] = [
 			{
 				value: FOLLOW_SESSION,
-				label: "跟随当前会话 (默认)",
+				label: "Follow current session (default)",
 				check: config.model === null,
 			},
 			...models.map((m) => ({
@@ -2082,8 +2520,8 @@ async function topicsConfigCommand(
 			})),
 		];
 		const mChoice = await pickFromList(ctx, {
-			title: "topics-config → 分类模型",
-			proseLines: ["选择 topic 意图分类使用的模型。Esc 退出（不保存）。"],
+			title: "topics-config → Classification Model",
+			proseLines: ["Choose the model used for topic-intent classification. Esc to exit (no save)."],
 			items: modelItems,
 			preferredValue: pickedKey,
 			escHint: "exit",
@@ -2098,7 +2536,7 @@ async function topicsConfigCommand(
 				: models.find((m) => modelKey(m) === mChoice);
 		if (!picked) {
 			if (mChoice === FOLLOW_SESSION) {
-				ctx.ui.notify("当前会话没有模型（no session model）", "warning");
+				ctx.ui.notify("Current session has no model (no session model)", "warning");
 				return;
 			}
 			continue; // model vanished between pick and resolve — re-loop
@@ -2112,7 +2550,7 @@ async function topicsConfigCommand(
 			const fallbackItems: PickerItem[] = [
 				{
 					value: FOLLOW_SESSION,
-					label: "跟随当前会话 (默认)",
+					label: "Follow current session (default)",
 					check: config.fallbackModel === null,
 				},
 				...models.map((m) => ({
@@ -2122,14 +2560,14 @@ async function topicsConfigCommand(
 				})),
 				{
 					value: FALLBACK_NONE,
-					label: "不配置 fallback",
+					label: "No fallback",
 					check: config.fallbackModel === FALLBACK_NONE,
 				},
 			];
 			fChoice = await pickFromList(ctx, {
-				title: "topics-config → fallback 模型",
+				title: "topics-config → Fallback Model",
 				proseLines: [
-					"主模型失败时按序重试：fallback 模型 → 会话模型；「不配置 fallback」则不做任何重试。Esc 返回模型选择。",
+					"When the primary model fails, retry in order: fallback model → session model; with \"No fallback\" no retry is performed. Esc returns to the model picker.",
 				],
 				items: fallbackItems,
 				preferredValue: fChoice ?? config.fallbackModel ?? FOLLOW_SESSION,
@@ -2142,7 +2580,7 @@ async function topicsConfigCommand(
 			const thinkItems: PickerItem[] = [
 				{
 					value: FOLLOW_SESSION,
-					label: "跟随当前会话 (默认)",
+					label: "Follow current session (default)",
 					check: config.thinking === null,
 				},
 				...levels.map((l) => ({
@@ -2152,11 +2590,11 @@ async function topicsConfigCommand(
 				})),
 			];
 			const tChoice = await pickFromList(ctx, {
-				title: "topics-config → 思考强度",
+				title: "topics-config → Thinking Level",
 				proseLines: [
-					`分类模型: ${mChoice === FOLLOW_SESSION ? "跟随当前会话" : mChoice}`,
-					`fallback 模型: ${fChoice === FOLLOW_SESSION ? "跟随当前会话" : fChoice === FALLBACK_NONE ? "不配置" : fChoice}`,
-					"选择思考强度。Esc 返回 fallback 模型选择。",
+					`Classification model: ${mChoice === FOLLOW_SESSION ? "Follow current session" : mChoice}`,
+					`Fallback model: ${fChoice === FOLLOW_SESSION ? "Follow current session" : fChoice === FALLBACK_NONE ? "None" : fChoice}`,
+					"Choose the thinking level. Esc returns to the fallback-model picker.",
 				],
 				items: thinkItems,
 				preferredValue: config.thinking ?? FOLLOW_SESSION,
@@ -2179,12 +2617,230 @@ async function topicsConfigCommand(
 			);
 			ctx.ui.notify(
 				ok
-					? `分类模型: ${newModel ?? "跟随当前会话"}, fallback: ${newFallback === null ? "跟随当前会话" : newFallback === FALLBACK_NONE ? "不配置" : newFallback}, think: ${newThinking ?? "跟随当前会话"}`
-					: "配置保存失败",
+					? `Classification model: ${newModel ?? "Follow current session"}, fallback: ${newFallback === null ? "Follow current session" : newFallback === FALLBACK_NONE ? "None" : newFallback}, think: ${newThinking ?? "Follow current session"}`
+					: "Config save failed",
 				ok ? "info" : "error",
 			);
 			return;
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// /topics-stats command — global / per-topic / session stats (in-chat text)
+// ---------------------------------------------------------------------------
+
+/** The stats Markdown report path for /topics-stats --export. */
+const STATS_EXPORT_FILE = join(STORE_DIR, "topic-memory-stats.md");
+
+/** Escape Markdown table-cell metacharacters (pipe / newline) in a title. */
+function escapeMdCell(s: string): string {
+	return s.replace(/\|/g, "\\|").replace(/\n/g, " ");
+}
+
+/**
+ * Render the full stats report (global + current session + per-topic rows)
+ * as Markdown. Pure — takes a store snapshot; used only by --export.
+ */
+function renderStatsMarkdown(store: Store, sessionId: string): string {
+	const g = computeGlobalStats(store.topics);
+	const md: string[] = [
+		`# pi-topic-memory Stats Report`,
+		``,
+		`- Generated: ${fmtDate(Date.now())}`,
+		`- session: ${sessionId || "?"}`,
+		`- Topics total: ${g.total}`,
+		``,
+		`## Global Stats`,
+		``,
+		`| Metric | Value |`,
+		`| --- | --- |`,
+		`| Status | ▶In progress ${g.byStatus.in_progress} / ✓Done ${g.byStatus.done} / ⏸Blocked ${g.byStatus.blocked} / ✕Dropped ${g.byStatus.dropped} |`,
+		`| Total decisions | ${g.decisionCount} (avg ${g.avgDecisions.toFixed(1)}/topic) |`,
+		`| Earliest created | ${g.earliestFirstSeen ?? "—"} |`,
+		`| Latest updated | ${g.latestLastUpdated ?? "—"} |`,
+		`| Avg age | ${g.avgAgeDays} days |`,
+		`| Link pairs | ${g.linkCount} |`,
+		`| Derived topics | ${g.derivedCount} (deepest ${g.maxDeriveDepth} levels) |`,
+		``,
+		`### Tag Frequency Top10`,
+		``,
+		`| Tag | Count |`,
+		`| --- | --- |`,
+	];
+	if (g.tagTop.length === 0) md.push(`| — | — |`);
+	for (const { tag, count } of g.tagTop) md.push(`| ${tag} | ${count} |`);
+	md.push(
+		``,
+		`### Project Distribution Top10`,
+		``,
+		`| Project | Count |`,
+		`| --- | --- |`,
+	);
+	if (g.projectTop.length === 0) md.push(`| — | — |`);
+	for (const { project, count } of g.projectTop)
+		md.push(`| ${project} | ${count} |`);
+	md.push(``, `## Session Run Metrics`, ``);
+	const sess = sessionStats.get(sessionId);
+	if (sess) {
+		md.push(`| Metric | Value |`, `| --- | --- |`);
+		md.push(`| Hot-path hits | ${sess.hotPathHits} |`);
+		md.push(`| LLM classifies | ${sess.llmClassifies} |`);
+		md.push(
+			`| Injections | ${sess.injectedCount} (${sess.injectedChars} chars) |`,
+		);
+		md.push(`| Decisions captured | ${sess.captureCount} |`);
+	} else {
+		md.push(`(No run metrics for this session yet)`);
+	}
+	md.push(``, `## All Topics (${g.total})`, ``);
+	md.push(
+		`| id | status | title | type | decisions | updated |`,
+		`| --- | --- | --- | --- | --- | --- |`,
+	);
+	for (const t of sortedTopics(store)) {
+		md.push(
+			`| ${t.id} | ${t.status} | ${escapeMdCell(t.title)} | ${t.type} | ${t.decisions.length} | ${relTime(t.lastUpdated)} |`,
+		);
+	}
+	return md.join("\n") + "\n";
+}
+
+/**
+ * /topics-stats entry point — best-effort, never throws.
+ * - no arg          → global ledger stats (in-chat text)
+ * - <id|关键词>      → one topic's detail (exact id first, then title match)
+ * - --session       → current session's run metrics (memory-only)
+ * - --export        → write the Markdown report (atomic tmp+rename) + path
+ */
+async function topicsStatsCommand(
+	args: string,
+	ctx: ExtensionContext,
+): Promise<void> {
+	try {
+		const store = loadStore();
+		const sessionId = ctx.sessionManager?.getSessionId?.() ?? "";
+
+		// flag 以 `--` 开头识别（不区分大小写，逐 token trim），其余 token 拼作搜索词；
+		// --export 优先于 --session（导出报告本身已包含会话部分）
+		const tokens = (args ?? "")
+			.trim()
+			.split(/\s+/)
+			.filter((t) => t.length > 0);
+		const isFlag = (t: string) => /^--/i.test(t);
+		const wantExport = tokens.some((t) => t.toLowerCase() === "--export");
+		const wantSession = tokens.some((t) => t.toLowerCase() === "--session");
+		const arg = tokens.filter((t) => !isFlag(t)).join(" ");
+
+		if (wantSession) {
+			const s = sessionStats.get(sessionId);
+			ctx.ui.notify(
+				s
+					? formatSessionStatsText(sessionId, s)
+					: `🖥 Session ${sessionId || "?"} has no run metrics yet (no hot-path/classify/inject/capture events this session)`,
+				"info",
+			);
+			return;
+		}
+
+		if (wantExport) {
+			// 与 saveStore 相同的原子写模式：tmp + renameSync
+			const tmp = `${STATS_EXPORT_FILE}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+			try {
+				mkdirSync(STORE_DIR, { recursive: true });
+				writeFileSync(tmp, renderStatsMarkdown(store, sessionId), "utf-8");
+				renameSync(tmp, STATS_EXPORT_FILE);
+			} catch (err) {
+				try {
+					if (tmp) unlinkSync(tmp);
+				} catch {
+					// best-effort cleanup
+				}
+				throw err;
+			}
+			log(`COMMAND: stats-export ${STATS_EXPORT_FILE}`);
+			ctx.ui.notify(`Stats report exported: ${STATS_EXPORT_FILE}`, "info");
+			return;
+		}
+
+		if (arg) {
+			// 精确 id 优先，否则标题不区分大小写包含匹配
+			const byId = store.topics.find((t) => t.id === arg);
+			if (byId) {
+				ctx.ui.notify(
+					formatTopicDetailText(computeTopicDetail(byId, store.topics)),
+					"info",
+				);
+				return;
+			}
+			const q = arg.toLowerCase();
+			const hits = store.topics.filter((t) =>
+				t.title.toLowerCase().includes(q),
+			);
+			if (hits.length === 1) {
+				ctx.ui.notify(
+					formatTopicDetailText(computeTopicDetail(hits[0], store.topics)),
+					"info",
+				);
+				return;
+			}
+			if (hits.length > 1) {
+				const candidates = hits
+					.slice(0, 10)
+					.map((t) => `  ${t.id} — ${t.title}`)
+					.join("\n");
+				ctx.ui.notify(
+					`Matched ${hits.length} topics, please specify a more precise id or title keyword:\n${candidates}`,
+					"info",
+				);
+				return;
+			}
+			ctx.ui.notify(`No topic matches "${arg}" (no id or title match)`, "warning");
+			return;
+		}
+
+		ctx.ui.notify(
+			formatGlobalStatsText(computeGlobalStats(store.topics)),
+			"info",
+		);
+	} catch (err) {
+		log(`ERROR: topics-stats ${errMsg(err)}`);
+		ctx.ui.notify(`/topics-stats error: ${errMsg(err)}`, "error");
+	}
+}
+
+/**
+ * /topics-inject-stats entry point — 统计注入日志，按 session 分组输出最近 N 个 session。
+ * - 无参数 → 最近 10 个 session（默认）
+ * - -n <正整数> → 数量覆盖，非法回退默认 10
+ * 输出纯文本表格。best-effort，never throws。
+ */
+async function topicsInjectStatsCommand(
+	args: string,
+	ctx: ExtensionContext,
+): Promise<void> {
+	try {
+		const limit = parseInjectStatsLimit(args);
+		if (!existsSync(LOG_FILE)) {
+			ctx.ui.notify(`Inject log does not exist: ${LOG_FILE}`, "warning");
+			return;
+		}
+		const lines = readFileSync(LOG_FILE, "utf-8").split(/\r?\n/);
+		const rows = computeInjectStats(lines, limit);
+		if (rows.length === 0) {
+			ctx.ui.notify(`Log is empty or has no inject records: ${LOG_FILE}`, "info");
+			return;
+		}
+		// 仅当 N 行内有 injected 之外的 outcome 时才显示「其它」列
+		const showOther = rows.some((r) => r.other > 0);
+		log(`COMMAND: inject-stats n=${limit} sessions=${rows.length}`);
+		ctx.ui.notify(
+			formatInjectStatsText(rows, limit, showOther),
+			"info",
+		);
+	} catch (err) {
+		log(`ERROR: topics-inject-stats ${errMsg(err)}`);
+		ctx.ui.notify(`/topics-inject-stats error: ${errMsg(err)}`, "error");
 	}
 }
 
@@ -2247,6 +2903,8 @@ function injectVerdict(
 	log(
 		`inject session=${sessionId || "?"} topic=${topic.id} mode=${config.injectDisplay} outcome=injected source=${source}`,
 	);
+	bumpSessionStat(sessionId, "injectedCount");
+	bumpSessionStat(sessionId, "injectedChars", content.length);
 	return { message: { customType: CUSTOM_TYPE, content, display: debug } };
 }
 
@@ -2254,7 +2912,7 @@ function injectVerdict(
 // turn-end decision capture (auto-capture)
 // ---------------------------------------------------------------------------
 
-const DISTILL_PROMPT = `你是决策摘要器。把 agent 的回合总结压缩成一条决策记录：一句话，只保留事实结论（做了什么、结果如何），去掉客套、重复和过程细节，不超过 50 字。直接输出文本，不要 markdown，不要解释。`;
+const DISTILL_PROMPT = `You are a decision summarizer. Compress the agent's turn summary into a single decision record: one sentence, keeping only factual conclusions (what was done and the result), removing pleasantries, repetition and process details, at most 50 characters. Keep the output in the same language as the input. Output plain text only, no markdown, no explanation.`;
 
 /**
  * Monotonic decision timestamp — strictly increasing so {topicId, at} is a
@@ -2486,6 +3144,7 @@ async function captureTurnDecision(
 	ctx: ExtensionContext,
 ): Promise<void> {
 	const sessionId = ctx.sessionManager?.getSessionId?.() ?? "";
+	bumpSessionStat(sessionId, "captureCount"); // agent_end 捕获决策次数
 	const raw = lastAssistantText(event.messages);
 	const topicId = sessionId ? activeTopicBySession.get(sessionId) : undefined;
 	if (!topicId) {
@@ -2536,7 +3195,9 @@ export default function topicTracker(pi: ExtensionAPI) {
 	// Multiple extensions' messages are merged by the runner; returning
 	// undefined when there is nothing to inject keeps this extension inert.
 	// The consume is NON-blocking: a verdict still pending is left in place
-	// for a later turn instead of stalling the loop start (F1).
+	// for a later turn instead of stalling the loop start (F1); a verdict
+	// that settled after its own round (leftover) is consumed here as
+	// source=late.
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (isSubagentSession(ctx)) return undefined; // sub-agent guard
 		const sessionId = ctx.sessionManager?.getSessionId?.() ?? "";
@@ -2544,9 +3205,9 @@ export default function topicTracker(pi: ExtensionAPI) {
 		const config = loadStore().config;
 		if (!taken) {
 			// No slot, or the classify verdict is still pending — never block.
-			log(
-				`inject session=${sessionId || "?"} topic=? mode=${config.injectDisplay} outcome=pending`,
-			);
+			// Deliberately no log and no state: pending means "first pass not
+			// ready", not an outcome; the slot (or a leftover) is consumed by
+			// a later round once it settles.
 			return undefined;
 		}
 		const { slot, verdict } = taken;
@@ -2601,11 +3262,15 @@ export default function topicTracker(pi: ExtensionAPI) {
 			activeTopicBySession.delete(sid);
 			pendingCapture.delete(sid); // late-verdict backfill entries die with the session
 			pendingInjectSlots.delete(sid); // drop this session's unconsumed classify slot
+			pendingInjectLeftovers.delete(sid); // ...and any late-injection leftover
+			sessionStats.delete(sid); // /topics-stats --session 的运行指标随会话销毁
 		} else {
 			// session id unavailable (rare) — fall back to clearing everything
 			activeTopicBySession.clear();
 			pendingCapture.clear();
 			pendingInjectSlots.clear();
+			pendingInjectLeftovers.clear();
+			sessionStats.clear();
 		}
 		looseTokenCache.clear(); // shared LRU — rebuild is cheap
 		injectedTopics.clear(); // /resume with the same sessionId must not suppress re-inject
@@ -2617,17 +3282,31 @@ export default function topicTracker(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("topics", {
-		description:
-			"浏览/更新 topic 台账（状态、重开、加决策）——全局 ~/.pi/agent/topic-memory.json",
+			description:
+				"Browse/update the topic ledger (status, reopen, add decisions) — global ~/.pi/agent/topic-memory.json",
 		handler: async (args, ctx) => {
 			await topicsCommand(args, ctx);
 		},
 	});
 	pi.registerCommand("topics-config", {
 		description:
-			"配置 topic 意图分类的模型与思考强度（跟随当前会话 或 指定 provider/id + thinking level）",
+			"Configure the model and thinking level for topic-intent classification (follow current session, or pick a specific provider/id + thinking level)",
 		handler: async (args, ctx) => {
 			await topicsConfigCommand(args, ctx);
+		},
+	});
+	pi.registerCommand("topics-stats", {
+		description:
+			"Topic-ledger stats (global / per-topic / session run metrics; --export writes a Markdown report)",
+		handler: async (args, ctx) => {
+			await topicsStatsCommand(args, ctx);
+		},
+	});
+	pi.registerCommand("topics-inject-stats", {
+		description:
+			"Inject-log stats (per-session, latest N by default 10, override with -n)",
+		handler: async (args, ctx) => {
+			await topicsInjectStatsCommand(args, ctx);
 		},
 	});
 }

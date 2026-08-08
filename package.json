@@ -1,6 +1,6 @@
 {
   "name": "@aiwayds/pi-topic-memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Global topic ledger for the pi coding agent: auto-detects work requirements from input (classify + match, non-blocking), injects the topic state into the agent context before each turn (silent by default, debug toggle shows a short line), and provides a /topics command to browse and update topic state (status, reopen, decisions).",
   "type": "module",
   "license": "Apache-2.0",

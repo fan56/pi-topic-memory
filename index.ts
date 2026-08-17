@@ -79,7 +79,14 @@ const CUSTOM_TYPE = "pi-topic-memory";
 const INJECT_MAX_DECISIONS = 3;
 
 /** A late verdict older than this is stale and dropped instead of injected. */
-const INJECT_LATE_MAX_AGE_MS = 30_000;
+const INJECT_LATE_MAX_AGE_MS = 600_000; // 10 min — the LLM slow path (2.5~15s) needs a much wider late window than the old 30s
+
+/** Verdict fingerprint cache (改动 3): a cached hit older than this is treated as stale. */
+const FIFTEEN_MIN = 900_000;
+/** Cap on the verdict fingerprint cache — oldest dropped when over. */
+const VERDICT_CACHE_CAPACITY = 100;
+/** before_agent_start bounded wait for a pending verdict (改动 4). */
+const INJECT_WAIT_MS = 2_000;
 
 // ---------------------------------------------------------------------------
 // turn-end decision capture (auto-capture) constants
@@ -836,6 +843,52 @@ function looseTopicMatch(tokens: string[], t: Topic): boolean {
 	);
 }
 
+/**
+ * Best-match scan over a topic list — shared by the LLM path (all topics) and
+ * the hot path (in_progress topics only). Scoring is verbatim from the LLM
+ * match loop: Dice max(title, firstSeen) with MATCH_THRESHOLD bar, plus
+ * PROJECT_MATCH_BONUS / TAG_MATCH_BONUS gated on real token overlap.
+ */
+function findBestTopicMatch(
+	topics: Topic[],
+	tokens: string[],
+	ctx: ExtensionContext,
+): { topic: Topic; score: number } | undefined {
+	let best: { topic: Topic; score: number } | undefined;
+	for (const topic of topics) {
+		// Tokenize once per text version (looseTokensFor LRU) — title and
+		// firstSeen never change after createTopic, safe for the main loop.
+		const cached = looseTokensFor(topic);
+		let score = Math.max(
+			matchScore(tokens, cached.title),
+			matchScore(tokens, cached.source),
+		);
+		// Additive semantic bonuses — deliberately OUTSIDE the token sets
+		// (mixing them in would dilute the Dice denominator and cascade the
+		// size-guard failure). Gated on REAL token overlap (score > 0, or a
+		// raw dice > 0 in the gray zone): a zero-overlap topic can never be
+		// lifted over the threshold by bonuses alone.
+		const hasShared =
+			score > 0 ||
+			dice(tokens, cached.title) > 0 ||
+			dice(tokens, cached.source) > 0;
+		if (hasShared) {
+			if (topic.project && topic.project === ctx.cwd)
+				score += PROJECT_MATCH_BONUS;
+			for (const tag of topic.tags) {
+				if (
+					tokens.some(
+						(t) => t === tag || t.includes(tag) || tag.includes(t),
+					)
+				)
+					score += TAG_MATCH_BONUS;
+			}
+		}
+		if (best === undefined || score > best.score) best = { topic, score };
+	}
+	return best;
+}
+
 // ---------------------------------------------------------------------------
 // LLM reply parsing
 // ---------------------------------------------------------------------------
@@ -894,6 +947,39 @@ function dedupeRecord(text: string): void {
 		if (oldest === undefined) break;
 		seenTexts.delete(oldest);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// verdict fingerprint cache (改动 3) — input-token fingerprint → matched topic
+// id. Written ONLY after a successful LLM classify matched verdict, so the hot
+// path / cache hits never refresh each other into perpetual hits. Key is
+// `sessionId|tokenize(input).join(" ")`; LRU-capped at VERDICT_CACHE_CAPACITY.
+// ---------------------------------------------------------------------------
+
+const verdictFingerprintCache = new Map<
+	string,
+	{ topicId: string; at: number }
+>();
+
+/** Write/refresh an entry; drop the oldest when over capacity. */
+function recordVerdictFingerprint(
+	sessionId: string,
+	inputText: string,
+	topicId: string,
+): void {
+	const key = `${sessionId}|${tokenize(inputText).join(" ")}`;
+	verdictFingerprintCache.delete(key); // refresh recency
+	verdictFingerprintCache.set(key, { topicId, at: Date.now() });
+	while (verdictFingerprintCache.size > VERDICT_CACHE_CAPACITY) {
+		const oldest = verdictFingerprintCache.keys().next().value;
+		if (oldest === undefined) break;
+		verdictFingerprintCache.delete(oldest);
+	}
+}
+
+/** Resolve after ms — bounded wait that must never stall a turn. */
+function timeout(ms: number): Promise<void> {
+	return new Promise((r) => setTimeout(r, ms));
 }
 
 /**
@@ -1006,7 +1092,7 @@ interface PendingInjectSlot {
 	resolve: (v: PendingInject | null) => void;
 	/** The raw input text that opened this slot (pre-expansion). */
 	inputText: string;
-	/** When the input arrived — verdicts older than 30s are stale. */
+	/** When the input arrived — verdicts older than 10 min are stale. */
 	createdAt: number;
 	/** True once resolve() ran — lets before_agent_start check without awaiting. */
 	settled: boolean;
@@ -1374,43 +1460,70 @@ function handleInput(text: string, ctx: ExtensionContext): void {
 				return;
 			}
 
-			// 3.5 热路径（免 LLM，0.4 门槛）：该 session 已有 active topic → 输入
-			// 与之相似度 ≥ MATCH_THRESHOLD 且仍 in_progress 才同步产出 matched
-			// verdict（settle 在本轮 before_agent_start 之前，注入首次真正生效）。
-			// tokenize 输入 1 次 + 2 次 matchScore（title/firstSeen 已由
-			// looseTokensFor 缓存），亚毫秒级。activeTopicBySession 是上轮 verdict
-			// 写下的，状态以磁盘为准（reopen/status 变更即时生效）。
-			const hotTopicId = sessionId
-				? activeTopicBySession.get(sessionId)
-				: undefined;
-			if (hotTopicId) {
-				const hotStore = loadStore();
-				const hotTopic = hotStore.topics.find((t) => t.id === hotTopicId);
-				if (hotTopic && hotTopic.status === "in_progress") {
-					const hotTokens = tokenize(trimmed);
-					const hotCached = looseTokensFor(hotTopic);
-					const hotScore = Math.max(
-						matchScore(hotTokens, hotCached.title),
-						matchScore(hotTokens, hotCached.source),
-					);
-					if (hotScore >= MATCH_THRESHOLD) {
-						bumpSessionStat(sessionId, "hotPathHits"); // 热路径免 LLM 命中
-						hotTopic.lastUpdated = Date.now();
-						saveStore(hotStore);
-						log(`HOT-PATH: ${hotTopic.id} (${hotScore.toFixed(2)})`);
-						setActiveTopic(sessionId, hotTopic.id); // refresh recency
-						const hotVerdict: PendingInject = {
-							kind: "matched",
-							topic: hotTopic,
-							sessionId,
-							inputText: text, // C4: this round's input, captured in the IIFE closure
-						};
-						flushPendingCapture(sessionId, hotTopic.id, ctx, hotVerdict); // C4: backfill a missed capture
-						slot.resolve(hotVerdict);
-						return;
-					}
+			// 3.5 热路径（免 LLM，0.4 门槛）：扫描全部 in_progress topics，用与 LLM
+			// 路径同一 findBestTopicMatch（含 project/tag bonus）找 best；
+			// best.score ≥ MATCH_THRESHOLD 才同步产出 matched verdict（settle 在
+			// 本轮 before_agent_start 之前，注入首次真正生效）。tokenize 输入 1 次
+			// + 每 topic 2 次 matchScore（title/firstSeen 已由 looseTokensFor 缓存），
+			// 亚毫秒级。topic 状态以磁盘为准（reopen/status 变更即时生效）。
+			const hotStore = loadStore();
+			const hotBest = findBestTopicMatch(
+				hotStore.topics.filter((t) => t.status === "in_progress"),
+				tokenize(trimmed),
+				ctx,
+			);
+			if (hotBest && hotBest.score >= MATCH_THRESHOLD) {
+				const hotTopic = hotBest.topic;
+				bumpSessionStat(sessionId, "hotPathHits"); // 热路径免 LLM 命中
+				hotTopic.lastUpdated = Date.now();
+				log(`HOT-PATH: ${hotTopic.id} (${hotBest.score.toFixed(2)})`);
+				setActiveTopic(sessionId, hotTopic.id); // refresh recency
+				const hotVerdict: PendingInject = {
+					kind: "matched",
+					topic: hotTopic,
+					sessionId,
+					inputText: text, // C4: this round's input, captured in the IIFE closure
+				};
+				flushPendingCapture(sessionId, hotTopic.id, ctx, hotVerdict); // C4: backfill a missed capture
+				slot.resolve(hotVerdict);
+				saveStore(hotStore); // 磁盘写延后到 resolve 之后（不阻塞 settle）
+				return;
+			}
+			// 无相似 in_progress topic（切话题）或全部已 done/删除 → 不注入，仍走 LLM 分类
+
+			// 3.6 verdict 指纹缓存（免 LLM）：该输入（tokenize 后 join）上次由 LLM
+			// classify 成功匹配过 → 若 topic 仍 in_progress 且命中距今 < FIFTEEN_MIN，
+			// 同步产出与热路径相同的 matched verdict。命中即 return，不再走 LLM；
+			// 不回写（缓存只由 LLM 成功 verdict 写入，避免互相刷新导致永续命中）。
+			const fingerprint = tokenize(trimmed).join(" ");
+			const cachedHit = verdictFingerprintCache.get(`${sessionId}|${fingerprint}`);
+			if (cachedHit) {
+				const cachedStore = loadStore();
+				const cachedTopic = cachedStore.topics.find(
+					(t) => t.id === cachedHit.topicId,
+				);
+				const cacheAge = Date.now() - cachedHit.at;
+				if (
+					cachedTopic &&
+					cachedTopic.status === "in_progress" &&
+					cacheAge < FIFTEEN_MIN
+				) {
+					bumpSessionStat(sessionId, "hotPathHits"); // 热路径（缓存）免 LLM 命中
+					cachedTopic.lastUpdated = Date.now();
+					log(`HOT-PATH(cache): ${cachedTopic.id}`);
+					setActiveTopic(sessionId, cachedTopic.id); // refresh recency
+					const cachedVerdict: PendingInject = {
+						kind: "matched",
+						topic: cachedTopic,
+						sessionId,
+						inputText: text, // C4: this round's input, captured in the IIFE closure
+					};
+					flushPendingCapture(sessionId, cachedTopic.id, ctx, cachedVerdict); // C4: backfill a missed capture
+					slot.resolve(cachedVerdict);
+					saveStore(cachedStore); // 磁盘写延后到 resolve 之后（不阻塞 settle）
+					return;
 				}
-				// 相似度不足（切话题）或 topic 已 done/删除 → 不注入，仍走 LLM 分类
+				// topic 已 done/删除 或 命中过期 → 忽略该条目，仍走 LLM 分类
 			}
 
 			// 4. LLM classify (fire-and-forget; re-read store after the await)
@@ -1509,38 +1622,7 @@ function handleInput(text: string, ctx: ExtensionContext): void {
 			// 5. match & persist (re-read fresh state, then one sync write)
 			const store = loadStore();
 			const tokens = tokenize(title);
-			let best: { topic: Topic; score: number } | undefined;
-			for (const topic of store.topics) {
-				// Tokenize once per text version (looseTokensFor LRU) — title and
-				// firstSeen never change after createTopic, safe for the main loop.
-				const cached = looseTokensFor(topic);
-				let score = Math.max(
-					matchScore(tokens, cached.title),
-					matchScore(tokens, cached.source),
-				);
-				// Additive semantic bonuses — deliberately OUTSIDE the token sets
-				// (mixing them in would dilute the Dice denominator and cascade the
-				// size-guard failure). Gated on REAL token overlap (score > 0, or a
-				// raw dice > 0 in the gray zone): a zero-overlap topic can never be
-				// lifted over the threshold by bonuses alone.
-				const hasShared =
-					score > 0 ||
-					dice(tokens, cached.title) > 0 ||
-					dice(tokens, cached.source) > 0;
-				if (hasShared) {
-					if (topic.project && topic.project === ctx.cwd)
-						score += PROJECT_MATCH_BONUS;
-					for (const tag of topic.tags) {
-						if (
-							tokens.some(
-								(t) => t === tag || t.includes(tag) || tag.includes(t),
-							)
-						)
-							score += TAG_MATCH_BONUS;
-					}
-				}
-				if (best === undefined || score > best.score) best = { topic, score };
-			}
+			const best = findBestTopicMatch(store.topics, tokens, ctx);
 			if (best !== undefined && best.score >= MATCH_THRESHOLD) {
 				best.topic.lastUpdated = Date.now();
 				appendDecision(best.topic, `New progress/request: ${summary}`);
@@ -1554,7 +1636,6 @@ function handleInput(text: string, ctx: ExtensionContext): void {
 						best.topic.tags = merged;
 					}
 				}
-				saveStore(store);
 				log(`EXISTING: ${best.topic.id} (${best.score.toFixed(2)})`);
 				const verdictSession = ctx.sessionManager?.getSessionId?.() ?? "";
 				const verdict: PendingInject = {
@@ -1568,6 +1649,8 @@ function handleInput(text: string, ctx: ExtensionContext): void {
 					flushPendingCapture(verdictSession, best.topic.id, ctx, verdict); // C4: backfill a missed capture
 				}
 				slot.resolve(verdict);
+				saveStore(store); // 磁盘写延后到 resolve 之后（不阻塞 settle）
+				recordVerdictFingerprint(verdictSession, trimmed, best.topic.id); // 改动 3：仅 LLM 成功 verdict 写缓存
 				return;
 			}
 			// derivedFrom 自动链：该 session 当前 active topic 成为新 topic 的父链
@@ -1586,7 +1669,6 @@ function handleInput(text: string, ctx: ExtensionContext): void {
 			});
 			store.topics.push(topic);
 			trimStore(store);
-			saveStore(store);
 			log(`NEW: ${topic.id}`);
 			const verdictSession = ctx.sessionManager?.getSessionId?.() ?? "";
 			const verdict: PendingInject = {
@@ -1600,6 +1682,8 @@ function handleInput(text: string, ctx: ExtensionContext): void {
 				flushPendingCapture(verdictSession, topic.id, ctx, verdict); // C4: backfill a missed capture
 			}
 			slot.resolve(verdict);
+			saveStore(store); // 磁盘写延后到 resolve 之后（不阻塞 settle）
+			recordVerdictFingerprint(verdictSession, trimmed, topic.id); // 改动 3：仅 LLM 成功 verdict 写缓存
 		} catch (err) {
 			slot.resolve(null);
 			cachedMr = null; // recreate on the next message — aligned with distill
@@ -3199,6 +3283,10 @@ export default function topicTracker(pi: ExtensionAPI) {
 	if (SENTINEL) return {};
 	(globalThis as any).__piTopicMemoryLoaded = true;
 
+	// 预热 ModelRuntime：create() 是覆盖所有 provider 的昂贵 auth sweep，激活期就
+	// fire-and-forget 付掉（不 await、不阻塞 factory），避免第一个 input 才同步付。
+	void getRuntime().catch(() => {});
+
 	pi.on("input", (event, ctx) => {
 		// Sub-agent guard: only the main interactive session is tracked —
 		// sub-agents neither create a classify slot nor run the ledger.
@@ -3218,14 +3306,18 @@ export default function topicTracker(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (isSubagentSession(ctx)) return undefined; // sub-agent guard
 		const sessionId = ctx.sessionManager?.getSessionId?.() ?? "";
-		const taken = takePendingInject(sessionId);
+		let taken = takePendingInject(sessionId);
 		const config = loadStore().config;
 		if (!taken) {
-			// No slot, or the classify verdict is still pending — never block.
-			// Deliberately no log and no state: pending means "first pass not
-			// ready", not an outcome; the slot (or a leftover) is consumed by
-			// a later round once it settles.
-			return undefined;
+			// 无 slot，或 classify verdict 仍 pending。若本 session 有未 settle 的
+			// slot，有界等待（最多 INJECT_WAIT_MS）让其 settle，等待后再取一次；
+			// 仍未取到则放弃（绝不无限等待）。无 slot 时行为不变。
+			const pending = pendingInjectSlots.get(sessionId);
+			if (pending && !pending.settled) {
+				await Promise.race([pending.promise, timeout(INJECT_WAIT_MS)]);
+				taken = takePendingInject(sessionId);
+			}
+			if (!taken) return undefined;
 		}
 		const { slot, verdict } = taken;
 		if (!verdict) return undefined; // classify decided not to inject
@@ -3279,6 +3371,7 @@ export default function topicTracker(pi: ExtensionAPI) {
 			activeTopicBySession.delete(sid);
 			pendingCapture.delete(sid); // late-verdict backfill entries die with the session
 			pendingInjectSlots.delete(sid); // drop this session's unconsumed classify slot
+			verdictFingerprintCache.clear(); // 改动 3：指纹缓存随 session 清空（键含 sessionId）
 			pendingInjectLeftovers.delete(sid); // ...and any late-injection leftover
 			sessionStats.delete(sid); // /topics-stats --session 的运行指标随会话销毁
 		} else {

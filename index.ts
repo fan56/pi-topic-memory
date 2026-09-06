@@ -52,6 +52,7 @@ import {
 	type Context,
 	type Model,
 	type ModelsSimpleStreamOptions,
+	type ModelThinkingLevel,
 	type ThinkingLevel,
 } from "@earendil-works/pi-ai";
 import {
@@ -2681,7 +2682,7 @@ async function topicsConfigCommand(
 					label: "Follow current session (default)",
 					check: config.thinking === null,
 				},
-				...levels.map((l) => ({
+				...levels.map((l: ModelThinkingLevel) => ({
 					value: l,
 					label: l,
 					check: config.thinking === l,

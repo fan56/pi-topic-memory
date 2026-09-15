@@ -164,6 +164,7 @@ export async function migrateLegacyJsonStore(store: BundleStore): Promise<Migrat
 			if (outcome !== "") {
 				conclusion = conclusion === "" ? `Outcome: ${outcome}` : `${conclusion}\n\nOutcome: ${outcome}`
 			}
+			const status = mapStatus(t.status)
 			const fm: okf.TopicFrontmatter = {
 				type: typeof t.type === "string" && t.type !== "" ? t.type : "topic",
 				title,
@@ -171,10 +172,18 @@ export async function migrateLegacyJsonStore(store: BundleStore): Promise<Migrat
 				depends,
 				open_questions: [],
 				impact: [],
-				status: mapStatus(t.status),
+				status,
 				generated: { by: "", at: "" }, // stamped by saveTopic (actor + generatedAt below)
 			}
-			const generatedAt = toIso(t.lastUpdated) ?? toIso(t.created) ?? new Date().toISOString()
+			// Dropped legacy topics map to deprecated, and generated.at is the
+			// TTL sweep's clock — keep the original timestamp and a 40-day-old
+			// drop would be swept the moment the first session starts. Stamp
+			// the migration time instead: full grace period, git still has the
+			// original provenance in the legacy backup.
+			const generatedAt =
+				status === "deprecated"
+					? new Date().toISOString()
+					: (toIso(t.lastUpdated) ?? toIso(t.created) ?? new Date().toISOString())
 			await store.saveTopic(
 				{ slug, doc: { fm, body: okf.setSection("", okf.CONCLUSION_HEADING, conclusion) } },
 				{ message: `topics(topic): create ${slug}`, created: true, generatedAt },

@@ -31,13 +31,14 @@ import {
 	renameSync,
 	statSync,
 } from "node:fs";
+import { dirname, join } from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
 	ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
-import { actorFor, configJsonFile, resolveBundleRoot } from "./paths";
-import { CONFIG_DEFAULTS, type Config } from "./config";
+import { actorFor, resolveBundleRoot } from "./paths";
+import { CONFIG_DEFAULTS, loadConfigSync as readConfigSync, type Config } from "./config";
 import { BundleStore } from "./store";
 import { Sync } from "./sync";
 import { migrateLegacyJsonStore } from "./migrate";
@@ -76,7 +77,9 @@ const EXIT_COMMIT_TIMEOUT_MS = 10_000;
 
 function log(line: string): void {
 	try {
-		const file = `${rootDir()}/topic-memory.log`;
+		// Outside the bundle root: the bundle is a user-visible git repo and
+		// an untracked log file would pollute its git status.
+		const file = join(dirname(resolveBundleRoot()), "topic-memory.log");
 		if (existsSync(file)) {
 			const { size } = statSync(file);
 			if (size > LOG_MAX_BYTES) {
@@ -91,41 +94,28 @@ function log(line: string): void {
 	}
 }
 
-function rootDir(): string {
-	// dirname of the bundle root (meta/config.json lives under root/meta)
-	return configJsonFile(resolveBundleRoot()).replace(/\/meta\/config\.json$/, "");
-}
-
 // ---------------------------------------------------------------------------
-// synchronous live config (meta/config.json + mtime-validated cache)
+// synchronous live config (config.loadConfigSync + mtime-validated cache)
 // ---------------------------------------------------------------------------
 
-let cachedConfig: Config = { ...CONFIG_DEFAULTS };
+let cachedConfig: Config | undefined;
 let cfgMtime = 0;
 let cfgSize = -1;
 
 function loadConfigSync(): Config {
 	try {
-		const file = configJsonFile(resolveBundleRoot());
+		const file = join(resolveBundleRoot(), "meta", "config.json");
 		const st = statSync(file);
-		if (st.mtimeMs === cfgMtime && st.size === cfgSize) return cachedConfig;
-		const parsed = JSON.parse(readFileSync(file, "utf8")) as unknown;
-		const out = { ...CONFIG_DEFAULTS } as Record<string, unknown>;
-		if (parsed && typeof parsed === "object") {
-			const defaults = CONFIG_DEFAULTS as unknown as Record<string, unknown>;
-			for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-				// Unknown keys dropped; type mismatches fall back to the default
-				// (a hand-edited config must not break lane arithmetic).
-				if (key in defaults && typeof value === typeof defaults[key]) {
-					out[key] = value;
-				}
-			}
+		if (cachedConfig && st.mtimeMs === cfgMtime && st.size === cfgSize) {
+			return cachedConfig;
 		}
-		cachedConfig = out as unknown as Config;
+		cachedConfig = readConfigSync(resolveBundleRoot());
 		cfgMtime = st.mtimeMs;
 		cfgSize = st.size;
 	} catch {
-		// missing/corrupt file — fail open with defaults
+		// missing/corrupt file — fail open with defaults (single source of
+		// truth for the validation itself lives in config.ts)
+		return { ...CONFIG_DEFAULTS };
 	}
 	return cachedConfig;
 }
@@ -379,10 +369,16 @@ export default function topicMemory(pi: ExtensionAPI) {
 			try {
 				await sync.pull();
 				runtimeRef ??= await getModelRuntime().catch(() => undefined);
-				const pending = await store.undistilledObservations(1);
-				if (pending.length > 0) {
-					const run = distiller.request(sid, "boot-replay");
-					if (run) await run.catch(() => undefined);
+				// Boot-replay only when no distill run is still in flight
+				// (same-process handoff, e.g. /resume): the in-flight run
+				// owns the queue head; observations persist, a later trigger
+				// drains whatever it leaves.
+				if (!distiller.hasAnyPending()) {
+					const pending = await store.undistilledObservations(1);
+					if (pending.length > 0) {
+						const run = distiller.request(sid, "boot-replay");
+						if (run) await run.catch(() => undefined);
+					}
 				}
 				await consolidator.maybeRun({ sessionId: sid });
 				const dropped = await dropExpiredDeprecated(
@@ -407,8 +403,10 @@ export default function topicMemory(pi: ExtensionAPI) {
 		const sid = sidOf(ctx);
 		if (sid) {
 			// One-shot session-end distill (fire-and-forget; boot-replay covers
-			// runs the teardown cuts short).
-			observer.onSessionEnd(sid);
+			// runs the teardown cuts short). Skipped when any run is still in
+			// flight — dsh's exit-path guard: a second concurrent run would
+			// race the queue head into duplicate topics and double GC counts.
+			if (!distiller.hasAnyPending()) observer.onSessionEnd(sid);
 			slowLane.clear(sid);
 			injectedBySession.delete(sid);
 			lastUserText.delete(sid);
@@ -435,9 +433,11 @@ export default function topicMemory(pi: ExtensionAPI) {
 		service,
 		distillNow: () =>
 			distiller.request(trackedSid || "manual", "manual") ??
+			// request() returns undefined for two reasons: route not
+			// configured, or a run already in flight — report which.
 			Promise.resolve({
 				ok: false,
-				reason: "no-model" as const,
+				reason: distiller.configured ? ("in-flight" as const) : ("no-model" as const),
 				created: [],
 				updated: [],
 				marked: 0,

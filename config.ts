@@ -13,6 +13,7 @@
  */
 
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
+import { readFileSync } from "node:fs"
 import { randomUUID } from "node:crypto"
 import { dirname } from "node:path"
 import { configJsonFile } from "./paths"
@@ -187,6 +188,12 @@ export async function loadConfig(root: string): Promise<Config> {
 		return cfg
 	}
 	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return cfg
+	return coerceConfig(parsed, cfg)
+}
+
+/** Shared per-key validation for loadConfig / loadConfigSync (fail-open). */
+function coerceConfig(parsed: unknown, cfg: Config): Config {
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return cfg
 	const o = parsed as Record<string, unknown>
 	// Union-typed key writes need a widened view (Config values are all
 	// primitives, so the alias is exact).
@@ -203,6 +210,28 @@ export async function loadConfig(root: string): Promise<Config> {
 		}
 	}
 	return cfg
+}
+
+/**
+ * Synchronous twin of loadConfig for hot-path callers (the injection lane
+ * reads config inside before_agent_start). Same validation, same fail-open
+ * defaults; callers that can await should prefer loadConfig.
+ */
+export function loadConfigSync(root: string): Config {
+	const cfg: Config = { ...CONFIG_DEFAULTS }
+	let raw: string
+	try {
+		raw = readFileSync(configJsonFile(root), "utf8")
+	} catch {
+		return cfg
+	}
+	let parsed: unknown
+	try {
+		parsed = JSON.parse(raw)
+	} catch {
+		return cfg
+	}
+	return coerceConfig(parsed, cfg)
 }
 
 /**

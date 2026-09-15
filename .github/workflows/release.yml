@@ -121,13 +121,18 @@ jobs:
         run: |
           PKG="${{ steps.pkg.outputs.name }}"
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          for attempt in 1 2 3 4 5 6; do
+          # npm processes publishes asynchronously: "Your package is being
+          # processed and may take a few minutes to become available" —
+          # v0.4.0 landed but stayed invisible past a 30s window and the
+          # verify failed the release red. Poll up to ~5 min (same window the
+          # dsh repos standardized after packument propagation >2 min).
+          for attempt in $(seq 1 30); do
             if npm view "${PKG}@${TAG_VERSION}" version >/dev/null 2>&1; then
               echo "verified: ${PKG}@${TAG_VERSION} is visible on the registry (attempt ${attempt})"
               exit 0
             fi
-            echo "attempt ${attempt}: not visible yet; waiting 5s"
-            sleep 5
+            echo "attempt ${attempt}: not visible yet; waiting 10s"
+            sleep 10
           done
           echo "::error::publish reported success but npm view never saw ${PKG}@${TAG_VERSION} — inspect the registry manually before trusting this release"
           exit 1

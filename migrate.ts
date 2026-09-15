@@ -34,6 +34,8 @@ import { legacyJsonStorePath, metaDir } from "./paths"
 export interface MigrateResult {
 	migrated: number
 	backup?: string
+	/** Per-topic import failures (reason surfaced; the topic stays only in the legacy backup). */
+	failures: { title: string; error: string }[]
 }
 
 interface LegacyDecision {
@@ -91,21 +93,21 @@ async function atomicWriteFile(file: string, content: string): Promise<void> {
  */
 export async function migrateLegacyJsonStore(store: BundleStore): Promise<MigrateResult> {
 	const markerPath = join(metaDir(store.root), ".migrated")
-	if (existsSync(markerPath)) return { migrated: 0 }
-	if ((await store.listTopics()).length > 0) return { migrated: 0 }
+	if (existsSync(markerPath)) return { migrated: 0, failures: [] }
+	if ((await store.listTopics()).length > 0) return { migrated: 0, failures: [] }
 
 	const legacyPath = legacyJsonStorePath(store.root)
 	let raw: string
 	try {
 		raw = await readFile(legacyPath, "utf8")
 	} catch {
-		return { migrated: 0 } // no legacy store — nothing to migrate
+		return { migrated: 0, failures: [] } // no legacy store — nothing to migrate
 	}
 	let legacy: LegacyStore
 	try {
 		legacy = JSON.parse(raw) as LegacyStore
 	} catch {
-		return { migrated: 0 } // corrupt legacy file — leave it alone, keep serving the (empty) bundle
+		return { migrated: 0, failures: [] } // corrupt legacy file — leave it alone, keep serving the (empty) bundle
 	}
 	const topics: LegacyTopic[] = Array.isArray(legacy.topics)
 		? (legacy.topics as unknown[]).filter((t): t is LegacyTopic => t !== null && typeof t === "object")
@@ -137,6 +139,7 @@ export async function migrateLegacyJsonStore(store: BundleStore): Promise<Migrat
 
 	// Phase 2 — one saveTopic commit per topic (per-topic revertible).
 	let migrated = 0
+	const failures: { title: string; error: string }[] = []
 	for (const { t, slug, title } of planned) {
 		try {
 			const depends: string[] = []
@@ -189,19 +192,26 @@ export async function migrateLegacyJsonStore(store: BundleStore): Promise<Migrat
 				{ message: `topics(topic): create ${slug}`, created: true, generatedAt },
 			)
 			migrated += 1
-		} catch {
+		} catch (err) {
 			// A single malformed topic must not abort the import; it stays only
 			// in the legacy file (renamed to .bak only on overall success, so a
-			// failed run can be retried after a fix).
+			// failed run can be retried after a fix). The reason is recorded —
+			// a silently partial import with a success marker is
+			// undiagnosable (a live dry-run hit an environmental git failure
+			// mid-import and undercounted without a trace).
+			failures.push({ title: title.slice(0, 80), error: String((err as Error)?.message ?? err).slice(0, 200) })
 		}
 	}
 
 	// Nothing landed: leave the legacy file in place so a later run can retry.
-	if (migrated === 0 && planned.length > 0) return { migrated: 0 }
+	if (migrated === 0 && planned.length > 0) return { migrated: 0, failures }
 
 	// Success marker first, then archive the old file (best-effort: a failed
 	// rename still reports the migration — the bundle now owns the data).
-	await atomicWriteFile(markerPath, `${JSON.stringify({ migratedAt: new Date().toISOString(), count: migrated }, null, 2)}\n`)
+	await atomicWriteFile(
+		markerPath,
+		`${JSON.stringify({ migratedAt: new Date().toISOString(), count: migrated, failed: failures.length }, null, 2)}\n`,
+	)
 	const backupPath = `${legacyPath}.migrated.bak`
 	let backup: string | undefined
 	try {
@@ -210,5 +220,5 @@ export async function migrateLegacyJsonStore(store: BundleStore): Promise<Migrat
 	} catch {
 		// old file missing/unrenamable — migration itself already succeeded
 	}
-	return { migrated, backup }
+	return { migrated, backup, failures }
 }

@@ -257,10 +257,16 @@ export default function topicMemory(pi: ExtensionAPI) {
 		try {
 			await store.ensure();
 			const migrated = await migrateLegacyJsonStore(store);
-			if (migrated.migrated > 0) {
+			if (migrated.migrated > 0 || migrated.failures.length > 0) {
 				log(
 					`migrate: ${migrated.migrated} legacy topic(s) imported${migrated.backup ? ` (backup ${migrated.backup})` : ""}`,
 				);
+				for (const f of migrated.failures.slice(0, 10)) {
+					log(`migrate: FAILED "${f.title}": ${f.error}`);
+				}
+				if (migrated.failures.length > 0) {
+					log(`migrate: ${migrated.failures.length} topic(s) NOT imported — see backup`);
+				}
 				service.invalidate();
 			}
 		} catch (err) {

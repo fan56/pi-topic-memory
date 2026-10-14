@@ -290,6 +290,11 @@ export default function topicMemory(pi: ExtensionAPI) {
 	// --- injection: synchronous lexical retrieval, zero LLM on the hot path -
 	pi.on("before_agent_start", (event, ctx) => {
 		try {
+			// Since pi 1.2.0 this event also fires for extension-triggered runs
+			// (pi.sendMessage with triggerTurn) as a "custom" variant without a
+			// prompt; only inject on real user prompts and leave any pending
+			// raw input untouched for the actual user turn.
+			if (event.messageType !== "user") return undefined;
 			if (!cfg().autoInject) return undefined;
 			if (!tracks(ctx)) return undefined;
 			const sid = sidOf(ctx);

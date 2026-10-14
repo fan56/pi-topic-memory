@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- fix: skip `before_agent_start` injection for extension-triggered runs (pi
+  1.2.0 turned the event into a `user`/`custom` union; only `user` events
+  carry a prompt). Custom runs no longer consume the pending raw input.
+
 ## 0.4.0
 
 Architecture port from the author's dsh-topics-memory. Breaking change in

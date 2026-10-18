@@ -2,9 +2,14 @@
 
 ## Unreleased
 
+## 0.4.1
+
 - fix: skip `before_agent_start` injection for extension-triggered runs (pi
   1.2.0 turned the event into a `user`/`custom` union; only `user` events
   carry a prompt). Custom runs no longer consume the pending raw input.
+- fix: declare `typebox` as a peerDependency instead of a bundled direct
+  dependency, so the extension reuses the host's single typebox copy instead
+  of shipping a second one (lockfile re-pinned accordingly).
 
 ## 0.4.0
 

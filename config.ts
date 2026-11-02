@@ -85,6 +85,57 @@ export interface Config {
 	 *  granted to zero-lexical candidates; the structural gate still applies.
 	 *  0 = off. */
 	usageBoost: number
+	/** Zero-open decay (dsh v5, default off): halve the retrieval score of slugs
+	 *  injected ≥5 times in the rolling 30 days with zero opens ever — the
+	 *  零打开高频 leaderboard stops out-ranking topics the model actually
+	 *  reads. false = zero behavior change; the reason tag `zero-open-decay`
+	 *  rides the hit/near-miss reasons when on. */
+	zeroOpenDecay: boolean
+	/** System One decision-model integration (dsh design 2026-09-25), default-off
+	 *  master switch: false means zero behavior change anywhere (the fast lane
+	 *  never calls out regardless — hard guard); the usage stats stop with it. */
+	jevEnabled: boolean
+	/** Decision backend: zen (free, opencode.ai) | native (typesafe
+	 *  first-party) | openrouter (decisions protocol). */
+	jevBackend: string
+	/** Pinned model id; '' = resolve the backend default at call time
+	 *  (distillModel sentinel pattern): jev-1.13-free / jev-1.13.0 /
+	 *  typesafe/jev-1.13 — an upgrade is a deliberate act. */
+	jevModel: string
+	/** Single-request timeout in ms; one AbortSignal, NO retry (the calling
+	 *  lane's next cadence is the natural retry, fail-open hard-coded). */
+	jevTimeoutMs: number
+	/** External secret list for the outbound secret gate (JEV_SECRET_FILE
+	 *  semantics, dsh design §3.3); swapping the path hot reloads the list. */
+	jevSecretFile: string
+	/** Local laya pace-maker (dsh design §3.4): fire a parallel laya call on
+	 *  every jev request; its verdict is logged for comparison and NEVER takes
+	 *  over — pure telemetry (real-traffic agreement was 0/14). Default off. */
+	jevLayaFallback: boolean
+	/** laya-serve systemone endpoint for the pace-maker (default: the local
+	 *  laya-serve bind from the laya repo's serve mode). */
+	jevLayaUrl: string
+	/** Local embedding provider (dsh A4 semantic reranker): ''
+	 *  sentinel = the whole semantic layer is OFF (pure lexical); 'ollama' =
+	 *  the local ollama embed API (localhost is the dsh ADR 0017 local
+	 *  exception). v1 ships no remote provider. */
+	embeddingProvider: string
+	/** Embedding model; '' = provider default (ollama → nomic-embed-text),
+	 *  same sentinel pattern as distillModel. */
+	embeddingModel: string
+	/** Injection-package master gate (dsh A-line): off | shadow | on.
+	 *  Carries the WHOLE new-behavior surface — query sanitization, the
+	 *  three-layer package, nearFloor semantic rerank, degradation. off = zero
+	 *  behavior change anywhere (byte-for-byte legacy); shadow = compute +
+	 *  bypass-ledger only, nothing lands in context; on = engage. */
+	packageMode: string
+	/** Lesson injection gate (dsh B2): off | shadow | on, default off.
+	 *  off = established lessons neither inject nor shadow (zero injection-
+	 *  side behavior); shadow = the lesson priority seat double-computes into
+	 *  the bypass ledger (meta/lesson-shadow.jsonl), never lands in context;
+	 *  on = established lessons inject. Only the injection side lives here —
+	 *  the lesson loop (distill/approval) is a separate concern. */
+	lessonInject: string
 	/** Debounced push delay in GitHub mode. */
 	pushDebounceSeconds: number
 }
@@ -115,6 +166,18 @@ export const CONFIG_DEFAULTS: Config = {
 	consolidateCadence: "daily",
 	deprecatedTtlDays: 15,
 	usageBoost: 0.15,
+	zeroOpenDecay: false,
+	jevEnabled: false,
+	jevBackend: "zen",
+	jevModel: "",
+	jevTimeoutMs: 3000,
+	jevSecretFile: "",
+	jevLayaFallback: false,
+	jevLayaUrl: "http://127.0.0.1:8000/v1/systemone",
+	embeddingProvider: "",
+	embeddingModel: "",
+	packageMode: "off",
+	lessonInject: "off",
 	pushDebounceSeconds: 45,
 }
 
@@ -143,13 +206,25 @@ export const CONFIG_KEYS = [
 	"consolidateCadence",
 	"deprecatedTtlDays",
 	"usageBoost",
+	"zeroOpenDecay",
+	"jevEnabled",
+	"jevBackend",
+	"jevModel",
+	"jevTimeoutMs",
+	"jevSecretFile",
+	"jevLayaFallback",
+	"jevLayaUrl",
+	"embeddingProvider",
+	"embeddingModel",
+	"packageMode",
+	"lessonInject",
 	"pushDebounceSeconds",
 ] as const
 
 export type ConfigKey = (typeof CONFIG_KEYS)[number]
 
 /** Keys whose values must be booleans (loadConfig type coercion). */
-const BOOL_KEYS: ReadonlySet<string> = new Set(["autoInject", "injectDedup", "suppressEcho", "autoObserve", "distillOnSessionEnd", "includeSubagents"])
+const BOOL_KEYS: ReadonlySet<string> = new Set(["autoInject", "injectDedup", "suppressEcho", "autoObserve", "distillOnSessionEnd", "includeSubagents", "zeroOpenDecay", "jevEnabled", "jevLayaFallback"])
 /** Keys whose values must be finite numbers (loadConfig type coercion). */
 const NUM_KEYS: ReadonlySet<string> = new Set([
 	"topK",
@@ -165,7 +240,7 @@ const NUM_KEYS: ReadonlySet<string> = new Set([
 	"distillMaxModelCalls",
 	"deprecatedTtlDays",
 	"usageBoost",
-	"pushDebounceSeconds",
+	"jevTimeoutMs",
 ])
 
 /**
@@ -273,10 +348,17 @@ export function parseConfigValue(key: ConfigKey, raw: string): boolean | number 
 		case "suppressEcho":
 		case "autoObserve":
 		case "distillOnSessionEnd":
-		case "includeSubagents": {
+		case "includeSubagents":
+		case "zeroOpenDecay":
+		case "jevEnabled":
+		case "jevLayaFallback": {
 			if (raw === "on" || raw === "true") return true
 			if (raw === "off" || raw === "false") return false
 			return { error: `${key} 取值 on|off` }
+		}
+		case "jevBackend": {
+			if (raw === "zen" || raw === "native" || raw === "openrouter") return raw
+			return { error: "jev-backend 取值 zen|native|openrouter" }
 		}
 		case "topK":
 		case "perTopicBudget":
@@ -288,7 +370,8 @@ export function parseConfigValue(key: ConfigKey, raw: string): boolean | number 
 		case "distillBatchSize":
 		case "distillMaxModelCalls":
 		case "deprecatedTtlDays":
-		case "pushDebounceSeconds": {
+		case "pushDebounceSeconds":
+		case "jevTimeoutMs": {
 			const n = Number(raw)
 			if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) return { error: `${key} 需要非负整数` }
 			return n
@@ -313,6 +396,22 @@ export function parseConfigValue(key: ConfigKey, raw: string): boolean | number 
 			return n
 		}
 		case "distillModel":
+		case "embeddingModel":
+		case "jevModel":
+		case "jevSecretFile":
+		case "jevLayaUrl":
 			return raw
+		case "embeddingProvider": {
+			if (raw === "" || raw === "ollama") return raw
+			return { error: "embedding-provider 仅支持 ollama（留空=语义层关；远程 provider 不进快道）" }
+		}
+		case "packageMode": {
+			if (raw === "off" || raw === "shadow" || raw === "on") return raw
+			return { error: "package-mode 取值 off|shadow|on" }
+		}
+		case "lessonInject": {
+			if (raw === "off" || raw === "shadow" || raw === "on") return raw
+			return { error: "lesson-inject 取值 off|shadow|on" }
+		}
 	}
 }

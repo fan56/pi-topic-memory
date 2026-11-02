@@ -10,12 +10,55 @@
  * file stays OKF-conformant and cross-linkable; graph helpers convert
  * between paths and slugs (dsh ADR 0005).
  *
+ * Ported from dsh-topics-memory/src/okf.ts (dsh v0.25.1). Deviations: dsh
+ * ADR references qualified as "dsh ADR 000x"; renderIndex auto-index line
+ * reads "pi-topic-memory" instead of "dsh-topics-memory".
+ *
  * @module okf
  */
 
 import { parseYaml, stringifyYaml, YamlError } from "./yaml"
 
 export type TopicStatus = "draft" | "stable" | "deprecated"
+
+/**
+ * Bundle entry kinds (B2, spec 2026-10-self-improve-topics §6.1): `topic` =
+ * factual knowledge (「是什么」), `lesson` = behavioral lesson (「怎么做事」).
+ * The kind rides the OKF `type` frontmatter field — the canonical serialized
+ * value for a lesson is `Lesson` (matching the `Topic` capitalization
+ * convention); recognition is case-insensitive so bundles written by the
+ * new repo's loop parse regardless of casing drift.
+ */
+export type TopicKind = "topic" | "lesson"
+
+/** lesson scope (B2 MJ-2, spec §6.2): workspace lessons inject only in the
+ *  workspace that produced them (cwd-hash match); global need no filter. */
+export type LessonScope = "workspace" | "global"
+/** lesson confidence (B2, spec §6.2): the FACT source — `status` derives from
+ *  it (hint↔draft, established↔stable); hint never injects (MJ-3). */
+export type LessonConfidence = "hint" | "established"
+/** lesson provenance (B2 BL-2, spec §6.2): machine-recognizable source tag;
+ *  uninstall reclamation keys on source≠manual (卷二 §9). */
+export type LessonSource = "distilled" | "correction" | "manual"
+
+/** kind from the raw `type` frontmatter value (case-insensitive `lesson`). */
+export function topicKindOf(type: string): TopicKind {
+	return typeof type === "string" && type.trim().toLowerCase() === "lesson"
+		? "lesson"
+		: "topic"
+}
+
+/** The canonical serialized `type` value per kind. */
+export function kindTypeValue(kind: TopicKind): string {
+	return kind === "lesson" ? "Lesson" : "Topic"
+}
+
+/** confidence 为事实源（B2 Minor）：hint↔draft、established↔stable.
+ *  `deprecated` is a lifecycle endpoint OUTSIDE the confidence axis — callers
+ *  set it directly (setLessonStatus / consolidation / TTL sweep). */
+export function deriveLessonStatus(confidence: LessonConfidence): TopicStatus {
+	return confidence === "established" ? "stable" : "draft"
+}
 
 export interface SourceEntry {
 	id?: string
@@ -52,6 +95,15 @@ export interface TopicFrontmatter {
 	verified?: TrustStamp
 	stale_after?: string
 	sources?: SourceEntry[]
+	// ---- lesson-kind fields (B2, spec §6.2) — present on kind=lesson docs ----
+	/** lesson 必带 scope（默认 workspace；global 需显式）。 */
+	scope?: LessonScope
+	/** confidence 事实源；status 派生（deriveLessonStatus）。默认 hint。 */
+	confidence?: LessonConfidence
+	/** provenance 标记（卸载回收按 source≠manual）。默认 manual。 */
+	source?: LessonSource
+	/** 写入时的 workspace 标识（cwd hash，MJ-2）；scope=global 时可空。 */
+	workspaceId?: string
 	/** Producer-defined extras — preserved on round-trip per OKF §4.1. */
 	[extra: string]: unknown
 }
@@ -84,7 +136,12 @@ function asTrust(v: unknown, field: string): TrustStamp {
 		throw new OkfError(`frontmatter.${field} must be an object {by, at}`)
 	}
 	const o = v as Record<string, unknown>
-	if (typeof o.by !== "string" || o.by === "" || typeof o.at !== "string" || o.at === "") {
+	if (
+		typeof o.by !== "string" ||
+		o.by === "" ||
+		typeof o.at !== "string" ||
+		o.at === ""
+	) {
 		throw new OkfError(`frontmatter.${field} requires string "by" and "at"`)
 	}
 	return { by: o.by, at: o.at }
@@ -93,7 +150,9 @@ function asTrust(v: unknown, field: string): TrustStamp {
 function asStatus(v: unknown): TopicStatus {
 	if (v === undefined || v === null || v === "") return "draft"
 	if (v === "draft" || v === "stable" || v === "deprecated") return v
-	throw new OkfError(`frontmatter.status must be draft|stable|deprecated, got "${String(v)}"`)
+	throw new OkfError(
+		`frontmatter.status must be draft|stable|deprecated, got "${String(v)}"`,
+	)
 }
 
 /**
@@ -113,12 +172,16 @@ export function parseTopicDoc(raw: string): TopicDoc {
 	if (typeof fmRaw.type !== "string" || fmRaw.type === "") {
 		throw new OkfError("frontmatter.type is required (OKF §4.1)")
 	}
-	const title = typeof fmRaw.title === "string" && fmRaw.title !== "" ? fmRaw.title : fmRaw.type
+	const title =
+		typeof fmRaw.title === "string" && fmRaw.title !== "" ? fmRaw.title : fmRaw.type
 	const tags = asStringArray(fmRaw.tags)
 	const depends = asStringArray(fmRaw.depends)
 	const open_questions = asStringArray(fmRaw.open_questions)
 	const impact = asStringArray(fmRaw.impact)
-	const generated = "generated" in fmRaw ? asTrust(fmRaw.generated, "generated") : { by: "unknown", at: new Date(0).toISOString() }
+	const generated =
+		"generated" in fmRaw
+			? asTrust(fmRaw.generated, "generated")
+			: { by: "unknown", at: new Date(0).toISOString() }
 	const fm: TopicFrontmatter = {
 		type: fmRaw.type,
 		title,
@@ -129,27 +192,73 @@ export function parseTopicDoc(raw: string): TopicDoc {
 		status: asStatus(fmRaw.status),
 		generated,
 	}
-	if (typeof fmRaw.description === "string" && fmRaw.description !== "") fm.description = fmRaw.description
+	if (typeof fmRaw.description === "string" && fmRaw.description !== "")
+		fm.description = fmRaw.description
 	// Triggers are producer-optional and must never invalidate an otherwise
 	// sound doc: non-string entries are filtered, not thrown (degrade, per the
 	// v4 design's "旧 bundle 无此字段降级不命中").
 	if (fmRaw.triggers !== undefined && fmRaw.triggers !== null) {
 		const raw = Array.isArray(fmRaw.triggers) ? fmRaw.triggers : [fmRaw.triggers]
-		const triggers = raw.filter((t): t is string => typeof t === "string" && t.trim() !== "").map((t) => t.trim())
+		const triggers = raw
+			.filter((t): t is string => typeof t === "string" && t.trim() !== "")
+			.map((t) => t.trim())
 		if (triggers.length > 0) fm.triggers = triggers
 	}
-	if ("verified" in fmRaw && fmRaw.verified !== null && fmRaw.verified !== undefined) fm.verified = asTrust(fmRaw.verified, "verified")
-	if (typeof fmRaw.stale_after === "string" && fmRaw.stale_after !== "") fm.stale_after = fmRaw.stale_after
+	if ("verified" in fmRaw && fmRaw.verified !== null && fmRaw.verified !== undefined)
+		fm.verified = asTrust(fmRaw.verified, "verified")
+	if (typeof fmRaw.stale_after === "string" && fmRaw.stale_after !== "")
+		fm.stale_after = fmRaw.stale_after
 	if (Array.isArray(fmRaw.sources)) {
 		fm.sources = fmRaw.sources.map((s) => {
-			if (s === null || typeof s !== "object" || typeof (s as Record<string, unknown>).resource !== "string") {
-				throw new OkfError("frontmatter.sources entries require a string \"resource\" (OKF §5.1)")
+			if (
+				s === null ||
+				typeof s !== "object" ||
+				typeof (s as Record<string, unknown>).resource !== "string"
+			) {
+				throw new OkfError(
+					'frontmatter.sources entries require a string "resource" (OKF §5.1)',
+				)
 			}
 			return s as SourceEntry
 		})
 	}
+	// ---- lesson-kind fields (B2, spec §6.2) — parsed on lesson docs only ----
+	// Invalid enum values DEGRADE TO THE DEFAULT (triggers precedent: a producer
+	// slip must never invalidate an otherwise sound doc); the seam writers own
+	// the closed vocabulary. On lesson docs these four keys join the known set
+	// so the extras loop cannot double-store a raw unvalidated value.
+	if (topicKindOf(fmRaw.type) === "lesson") {
+		fm.scope = fmRaw.scope === "global" ? "global" : "workspace"
+		fm.confidence = fmRaw.confidence === "established" ? "established" : "hint"
+		fm.source =
+			fmRaw.source === "distilled" || fmRaw.source === "correction"
+				? fmRaw.source
+				: "manual"
+		if (typeof fmRaw.workspaceId === "string" && fmRaw.workspaceId !== "")
+			fm.workspaceId = fmRaw.workspaceId
+	}
 	// Preserve unknown producer-defined keys verbatim (OKF §4.1 extensions).
-	const known = new Set(["type", "title", "description", "tags", "triggers", "depends", "open_questions", "impact", "status", "generated", "verified", "stale_after", "sources"])
+	const known = new Set([
+		"type",
+		"title",
+		"description",
+		"tags",
+		"triggers",
+		"depends",
+		"open_questions",
+		"impact",
+		"status",
+		"generated",
+		"verified",
+		"stale_after",
+		"sources",
+	])
+	if (fm.scope !== undefined || fm.confidence !== undefined || fm.source !== undefined) {
+		known.add("scope")
+		known.add("confidence")
+		known.add("source")
+		known.add("workspaceId")
+	}
 	for (const [k, v] of Object.entries(fmRaw)) {
 		if (!known.has(k)) fm[k] = v
 	}
@@ -174,6 +283,11 @@ export function serializeTopicDoc(doc: TopicDoc): string {
 	if (fm.verified !== undefined) out.verified = { by: fm.verified.by, at: fm.verified.at }
 	if (fm.stale_after !== undefined) out.stale_after = fm.stale_after
 	if (fm.sources !== undefined && fm.sources.length > 0) out.sources = fm.sources
+	// lesson fields serialize in a fixed slot (deterministic order, spec §6.2).
+	if (fm.scope !== undefined) out.scope = fm.scope
+	if (fm.confidence !== undefined) out.confidence = fm.confidence
+	if (fm.source !== undefined) out.source = fm.source
+	if (fm.workspaceId !== undefined) out.workspaceId = fm.workspaceId
 	for (const [k, v] of Object.entries(fm)) {
 		if (!(k in out)) out[k] = v
 	}
@@ -187,19 +301,23 @@ export function splitSections(body: string): { heading: string; text: string }[]
 	for (const line of body.split("\n")) {
 		const m = /^# (.+)$/.exec(line)
 		if (m !== null) {
-			if (current !== undefined) sections.push({ heading: current.heading, text: current.text.join("\n").trim() })
+			if (current !== undefined)
+				sections.push({ heading: current.heading, text: current.text.join("\n").trim() })
 			current = { heading: m[1].trim(), text: [] }
 		} else if (current !== undefined) {
 			current.text.push(line)
 		}
 	}
-	if (current !== undefined) sections.push({ heading: current.heading, text: current.text.join("\n").trim() })
+	if (current !== undefined)
+		sections.push({ heading: current.heading, text: current.text.join("\n").trim() })
 	return sections
 }
 
 /** The text under a given `# Heading`, or undefined when absent. */
 export function sectionOf(body: string, heading: string): string | undefined {
-	const hit = splitSections(body).find((s) => s.heading.toLowerCase() === heading.toLowerCase())
+	const hit = splitSections(body).find(
+		(s) => s.heading.toLowerCase() === heading.toLowerCase(),
+	)
 	return hit === undefined ? undefined : hit.text
 }
 
@@ -234,7 +352,10 @@ export function slugify(title: string): string {
 		.toLowerCase()
 		.normalize("NFKC")
 		.replace(/[\s_]+/g, "-")
-		.replace(/[^\p{Script=Latin}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Cyrillic}\p{Nd}-]/gu, "")
+		.replace(
+			/[^\p{Script=Latin}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Cyrillic}\p{Nd}-]/gu,
+			"",
+		)
 		.replace(/-{2,}/g, "-")
 		.replace(/^-+|-+$/g, "")
 		.slice(0, 64)
@@ -310,7 +431,8 @@ export function renderIndex(entries: IndexEntry[]): string {
 		"",
 	]
 	for (const e of entries.sort((a, b) => a.slug.localeCompare(b.slug))) {
-		const desc = e.description !== undefined && e.description !== "" ? ` — ${e.description}` : ""
+		const desc =
+			e.description !== undefined && e.description !== "" ? ` — ${e.description}` : ""
 		lines.push(`- [${e.title}](topics/${e.slug}.md) \`${e.status}\`${desc}`)
 	}
 	return lines.join("\n") + "\n"
@@ -331,7 +453,8 @@ const MD_LINK = /\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g
  */
 export function normalizeLinkTarget(target: string): string | undefined {
 	let t = target.trim()
-	if (t === "" || t.includes("://") || t.startsWith("#") || t.startsWith("mailto:")) return undefined
+	if (t === "" || t.includes("://") || t.startsWith("#") || t.startsWith("mailto:"))
+		return undefined
 	t = t.split("#")[0].trim()
 	if (t === "") return undefined
 	if (t.endsWith(".md")) t = t.slice(0, -3)
@@ -352,9 +475,7 @@ export function normalizeLinkTarget(target: string): string | undefined {
  */
 export function bodyLinkSlugs(body: string): string[] {
 	const out = new Set<string>()
-	const prose = body
-		.replace(/```[\s\S]*?```/g, "")
-		.replace(/`[^`\n]*`/g, "")
+	const prose = body.replace(/```[\s\S]*?```/g, "").replace(/`[^`\n]*`/g, "")
 	for (const m of prose.matchAll(WIKILINK)) {
 		const slug = normalizeLinkTarget(m[1])
 		if (slug !== undefined) out.add(slug)

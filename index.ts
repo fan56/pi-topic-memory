@@ -44,7 +44,7 @@ import { Sync } from "./sync";
 import { migrateLegacyJsonStore } from "./migrate";
 import { TopicsService, type SlowDelivery } from "./service";
 import { Observer } from "./observer";
-import { Distiller, type SaveTopicFn } from "./distill";
+import { Distiller } from "./distill";
 import { Consolidator, dropExpiredDeprecated } from "./consolidate";
 import { SlowLane, type ConsumeResult } from "./quality";
 import {
@@ -55,7 +55,6 @@ import {
 } from "./modelcaller";
 import { registerTopicTools } from "./tools";
 import { registerTopicsCommands } from "./commands";
-import { searchTopics as retrievalSearchTopics } from "./retrieval";
 
 // ---------------------------------------------------------------------------
 // constants
@@ -91,6 +90,23 @@ function log(line: string): void {
 		appendFileSync(file, `${new Date().toISOString()} ${line}\n`);
 	} catch {
 		// logging must never take the host down
+	}
+}
+
+/** Low-noise silent-exit reporter (dsh 0.17.1 observability contract): the
+ *  fast lane going quiet must be visible — first occurrence warns, then one
+ *  line per 50 occurrences, `$PI_TOPICS_DEBUG=1` logs every one. */
+const SILENT_EXIT_LOG_EVERY = 50;
+const silentExitCounts = new Map<string, number>();
+function silentExit(key: string, detail: string): void {
+	try {
+		const n = (silentExitCounts.get(key) ?? 0) + 1;
+		silentExitCounts.set(key, n);
+		if (process.env.PI_TOPICS_DEBUG === "1" || n === 1 || n % SILENT_EXIT_LOG_EVERY === 0) {
+			log(`快道本轮未触发（${key}，累计 ${n} 次）：${detail}`);
+		}
+	} catch {
+		// contained — observability must never break the lane
 	}
 }
 
@@ -194,9 +210,7 @@ export default function topicMemory(pi: ExtensionAPI) {
 	// --- core objects -------------------------------------------------------
 	const store = new BundleStore(root, { actor: actorFor() });
 	const sync = new Sync(store, cfg);
-	const service = new TopicsService({ store, cfg, sync });
-
-	const saveTopicFn: SaveTopicFn = (input) => service.saveTopic(input);
+	const service = new TopicsService(store, cfg, sync);
 
 	// ModelRuntime.create() is an expensive provider auth sweep — warm it
 	// once, fire-and-forget; lanes short-circuit to no-model until it lands.
@@ -223,30 +237,13 @@ export default function topicMemory(pi: ExtensionAPI) {
 		},
 	});
 
-	const distiller = new Distiller({
-		store,
-		cfg,
-		saveTopic: saveTopicFn,
-		caller,
-		schedulePush: () => sync.schedulePush(),
-	});
-
-	const consolidator = new Consolidator({
-		store,
-		cfg,
-		saveTopic: saveTopicFn,
-		usageSignalsSync: () => service.usageSignalsSync(),
-		invalidate: () => service.invalidate(),
-		schedulePush: () => sync.schedulePush(),
-		caller,
-	});
-
-	const slowLane = new SlowLane({
-		cfg,
-		roster: () => service.roster(),
-		searchTopics: (query, roster, opts) => retrievalSearchTopics(query, roster, opts),
-		caller,
-	});
+	// Lanes follow dsh HEAD shapes: they hold the service (type-only import)
+	// plus the shared caller getter. pi has no per-session LLM handle to
+	// release (ModelRuntime is a process-wide lazy singleton), so SlowLane's
+	// settle hook keeps its do-nothing default.
+	const distiller = new Distiller(service, caller);
+	const consolidator = new Consolidator(service, caller, undefined, log);
+	const slowLane = new SlowLane(service, caller);
 
 	// --- per-session state --------------------------------------------------
 	const lastUserText = new Map<string, string>();
@@ -302,7 +299,13 @@ export default function topicMemory(pi: ExtensionAPI) {
 			const raw = lastUserText.get(sid);
 			lastUserText.delete(sid);
 			const query = (raw ?? event.prompt ?? "").trim();
-			if (!query || isCommandish(query)) return undefined;
+			if (!query || isCommandish(query)) {
+				// A real user prompt without captured text means the input hook
+				// missed it (non-interactive source, custom run) — the fast lane
+				// skipping silently here is exactly the 0.17.1 incident shape.
+				if (!isCommandish(query)) silentExit("no-input", "before_agent_start 拿到空 query（input 钩子没捕获到文本）");
+				return undefined;
+			}
 
 			const exclude = cfg().injectDedup ? injectedBySession.get(sid) : undefined;
 			const echo = cfg().suppressEcho ? service.echoSlugsSync(sid) : undefined;
@@ -316,7 +319,19 @@ export default function topicMemory(pi: ExtensionAPI) {
 			else if (consumed && "expired" in consumed) slowExpired = consumed.expired;
 
 			const result = service.retrieveSync(query, sid, { exclude, echo }, slow, slowExpired);
-			if (!result.text) return undefined;
+			if (!result.text) {
+				// Empty retrieval with a live query: distinguish "empty roster"
+				// (bundle never populated) from "all candidates gated" — both are
+				// healthy states, but they must stay observable (dsh 0.17.1).
+				const rosterSize = result.outcome.rosterSize;
+				silentExit(
+					rosterSize === 0 ? "no-roster" : "no-injection",
+					rosterSize === 0
+						? "roster 为空（topics 库 0 条）——本轮不写 ilog 记录"
+						: `roster ${rosterSize} 条全部未过门/被去重`,
+				);
+				return undefined;
+			}
 
 			if (cfg().injectDedup && (result.included.length > 0 || result.slowIncluded.length > 0)) {
 				// Only what actually entered context is registered — budget-
@@ -373,40 +388,79 @@ export default function topicMemory(pi: ExtensionAPI) {
 	});
 
 	// --- session start: pull, boot-replay distill, consolidate, TTL sweep ---
+	// The whole chain runs on a deferred 1.5s unref'd timer (dsh 0.25.1): the
+	// pull's git/DNS child processes must not compete with the host's
+	// first-frame I/O on a cold, network-starved machine, and the timer must
+	// never hold a dying process open. Chain order, single-flight gates and
+	// failure semantics are unchanged.
+	const runBootChain = (sessionId: string): void => {
+		try {
+			void sync
+				.pull()
+				.catch((err) => {
+					// Non-fatal for the chain, but never silent (dsh 0.25.1).
+					log(`启动同步 pull 失败（继续本地启动链）：${err instanceof Error ? err.message : String(err)}`);
+				})
+				.finally(() => store.ensure().catch(() => undefined))
+				.then(() => {
+					void getModelRuntime()
+						.then((rt) => {
+							runtimeRef = rt;
+						})
+						.catch(() => undefined);
+					// Boot-replay only when no distill run is still in flight
+					// (same-process handoff, e.g. /resume): the in-flight run
+					// owns the queue head; observations persist, a later trigger
+					// drains whatever it leaves.
+					if (!distiller.hasAnyPending()) {
+						void store
+							.undistilledObservations(1)
+							.then((pending) => {
+								if (pending.length === 0) return;
+								const run = distiller.request(sessionId, "boot-replay");
+								if (run) {
+									void run
+										.then(() => service.refreshEmbeddingIndex())
+										.catch(() => undefined);
+								}
+							})
+							.catch(() => undefined);
+					}
+					// Consolidation cadence check — after the pull (freshest
+					// pool), fully fire-and-forget: cadence/single-flight gates
+					// live inside maybeRun; a no-model boot just skips.
+					void consolidator
+						.maybeRun({ sessionId })
+						.catch(() => undefined);
+					// Deprecated-TTL sweep — pure local rule, no model; drops
+					// are logged (deletion is the one housekeeping action the
+					// user should always see happened).
+					const ttl = cfg().deprecatedTtlDays;
+					if (ttl > 0) {
+						void dropExpiredDeprecated(service, ttl)
+							.then((dropped) => {
+								if (dropped.length > 0) {
+									log(`按 ${ttl} 天 TTL 删除了 ${dropped.length} 条 deprecated topic（${dropped.map((s) => `topics/${s}`).join("、")}）；git 历史可找回`);
+								}
+							})
+							.catch(() => undefined);
+					}
+					// Embedding index maintenance: boot-time freshness check +
+					// incremental rebuild — provider '' / packageMode off = no-op.
+					void service.refreshEmbeddingIndex().catch(() => undefined);
+				})
+				.catch((err) => {
+					log(`启动链失败（不影响会话启动）：${err instanceof Error ? err.message : String(err)}`);
+				});
+		} catch (err) {
+			log(`启动链无法启动（不影响会话启动）：${err instanceof Error ? err.message : String(err)}`);
+		}
+	};
 	pi.on("session_start", (_event, ctx) => {
 		const sid = sidOf(ctx);
 		if (sid) trackedSid = sid;
-		void (async () => {
-			try {
-				await sync.pull();
-				runtimeRef ??= await getModelRuntime().catch(() => undefined);
-				// Boot-replay only when no distill run is still in flight
-				// (same-process handoff, e.g. /resume): the in-flight run
-				// owns the queue head; observations persist, a later trigger
-				// drains whatever it leaves.
-				if (!distiller.hasAnyPending()) {
-					const pending = await store.undistilledObservations(1);
-					if (pending.length > 0) {
-						const run = distiller.request(sid, "boot-replay");
-						if (run) await run.catch(() => undefined);
-					}
-				}
-				await consolidator.maybeRun({ sessionId: sid });
-				const dropped = await dropExpiredDeprecated(
-					{
-						store,
-						invalidate: () => service.invalidate(),
-						schedulePush: () => sync.schedulePush(),
-					},
-					cfg().deprecatedTtlDays,
-				);
-				if (dropped.length > 0) {
-					log(`TTL sweep dropped deprecated: ${dropped.join(", ")}`);
-				}
-			} catch (err) {
-				log(`session-start lanes failed: ${String(err)}`);
-			}
-		})();
+		const deferred = setTimeout(() => runBootChain(sid), 1500);
+		deferred.unref?.();
 	});
 
 	// --- session teardown: state cleanup, sentinel reset --------------------

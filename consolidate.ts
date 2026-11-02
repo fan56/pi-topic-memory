@@ -1,6 +1,5 @@
 /**
- * Consolidation lane (pi port) — periodic LLM gardening over the topic pool
- * itself.
+ * Consolidation lane — periodic LLM gardening over the topic pool itself.
  *
  * Where the distill lane turns observations into topics, this lane turns the
  * EXISTING pool into a better one: merging near-duplicates, promoting drafts
@@ -23,15 +22,32 @@
  *  - the cadence stamp (meta/consolidate-state.json) advances only when the
  *    model actually evaluated at least one cluster — a run that died on the
  *    first call leaves the stamp alone, and the next session start retries.
+ *  - jev prefilter (design 2026-09-25 §2, default-off): with jevEnabled the
+ *    cluster first answers to ONE cheap System One batch (≤6 questions: the
+ *    top-5 similar pairs each ask 「同一问题吗」, plus a record-only
+ *    cluster-level 「值得动吗」). Only when ≥1 pair reaches the adopt band
+ *    (≥0.50) does the cluster go to the LLM — an all-non-adopt cluster skips
+ *    the model call entirely. Any jev failure fails open to today's behavior;
+ *    the merge conclusion generation itself stays LLM.
+ *
+ * Ported from dsh-topics-memory/src/consolidate.ts (dsh v0.25.1). Deviations:
+ * config type Config (from ./config) replaces TopicsConfigValue; the
+ * distillProvider+distillModel route collapses to the single distillModel key
+ * (route gate + message say `distillModel`); the caller seam keeps pi's
+ * getter injection form `() => ModelCaller | undefined` (defensive try/catch
+ * in `configured`).
  *
  * @module consolidate
  */
 
-import * as okf from "./okf";
-import type { BundleStore } from "./store";
-import type { Config } from "./config";
-import type { TopicCaller } from "./modelcaller";
-import { parseOps, type SaveTopicFn } from "./distill";
+import * as okf from "./okf"
+import type { Config } from "./config"
+import type { TopicsService } from "./service"
+import { parseOps, type ModelCaller } from "./distill"
+import { jevAsk, type JevAskConfig, type JevQuestion } from "./jev/client"
+import { band, type JevBand } from "./jev/thresholds"
+import { digestFor, logVerdicts } from "./jev/log"
+import type { JevVerdictRecord } from "./jev/log"
 
 /** Below this pairwise Jaccard two topics never share a cluster. */
 const CLUSTER_THRESHOLD = 0.3
@@ -44,6 +60,12 @@ const MAX_OPS_PER_RUN = 12
 /** Conclusion chars fed per topic in a cluster payload. */
 const CONCLUSION_SNIPPET_CHARS = 600
 const CONSOLIDATE_MAX_TOKENS = 2500
+/**
+ * Pair questions per cluster batch (design §2: k≤5, so with the record-only
+ * cluster-level question a batch stays ≤6 问/簇 — the measured cheap end of
+ * the batch protocol).
+ */
+const PREFILTER_TOP_PAIRS = 5
 
 export interface ConsolidateOp {
 	op: "merge" | "promote" | "deprecate" | "refresh"
@@ -88,17 +110,17 @@ export interface ConsolidateResult {
 
 export const CONSOLIDATE_SYSTEM_PROMPT = [
 	"你是 topic 记忆库的整理引擎（园丁）。输入是一个候选簇：若干条可能相近的已有 topic（JSON，含 slug/标题/状态/标签/结论摘要）。",
-	"任务：判断簇内有没有值得整理的动作，输出严格 JSON：{\"ops\":[...]}，不要任何其他文字或代码块解释。只允许四类 op：",
-	"  {\"op\":\"merge\",\"survivor\":\"保留条目的slug\",\"merged\":[\"被并入的slug\",...],\"conclusion\":\"合并后的完整结论\",\"title\":\"合并后的标题(可选)\",\"tags\":[\"并集标签(可选)\"],\"reason\":\"一句话理由\"}",
-	"  {\"op\":\"promote\",\"slug\":\"...\",\"reason\":\"一句话理由\"}　　# draft 且结论已自含、有效 → stable",
-	"  {\"op\":\"deprecate\",\"slug\":\"...\",\"reason\":\"一句话理由\"}　# 已被更新结论取代/不再成立 → deprecated",
-	"  {\"op\":\"refresh\",\"slug\":\"...\",\"title\":\"...\",\"description\":\"...\",\"tags\":[...],\"triggers\":[...],\"reason\":\"一句话理由\"}　# 只修元数据，让标题/标签/触发词更准确、可检索",
+	'任务：判断簇内有没有值得整理的动作，输出严格 JSON：{"ops":[...]}，不要任何其他文字或代码块解释。只允许四类 op：',
+	'  {"op":"merge","survivor":"保留条目的slug","merged":["被并入的slug",...],"conclusion":"合并后的完整结论","title":"合并后的标题(可选)","tags":["并集标签(可选)"],"reason":"一句话理由"}',
+	'  {"op":"promote","slug":"...","reason":"一句话理由"}　　# draft 且结论已自含、有效 → stable',
+	'  {"op":"deprecate","slug":"...","reason":"一句话理由"}　# 已被更新结论取代/不再成立 → deprecated',
+	'  {"op":"refresh","slug":"...","title":"...","description":"...","tags":[...],"triggers":[...],"reason":"一句话理由"}　# 只修元数据，让标题/标签/触发词更准确、可检索',
 	"规则：",
 	"- merge 只用于结论重复或高度重叠的条目：conclusion 必须是合并后的完整结论（自含、不依赖原文也能读懂），取双方有效信息的并集，不丢关键事实；survivor 选信息更全或更新的那条。",
 	"- refresh 禁止改结论——它只能修 title/description/tags/triggers；想改结论就用 merge 或不要动。",
 	"- slug 必须从输入里逐字复制，禁止改写、缩写或编造；survivor 不得出现在它自己的 merged 里。",
 	"- payload 里的 injections30d/opens30d 是该 topic 近 30 天被注入命中的次数与被点开的次数：0 表示近期从未被检索命中，可作为 deprecate 或 refresh（修命名/标签）的支持证据；但不要仅凭零使用就 deprecate——新条目和小众但关键的条目也会零命中。",
-	"- 拿不准就不动：宁可输出 {\"ops\":[]}。禁止 create 新 topic，禁止输出这四类之外的 op。",
+	'- 拿不准就不动：宁可输出 {"ops":[]}。禁止 create 新 topic，禁止输出这四类之外的 op。',
 	"- 全部用中文写内容；tags 全小写。",
 ].join("\n")
 
@@ -136,10 +158,22 @@ export interface ClusterEntry {
 	conclusion: string
 }
 
+/** One similar pair inside a cluster — the jev prefilter's question units. */
+export interface ClusterPair {
+	/** Indices into the cluster's `entries`. */
+	i: number
+	j: number
+	/** Pairwise Jaccard from clustering — REUSED for the prefilter's pair
+	 *  selection (top-k at ask time), never recomputed. */
+	similarity: number
+}
+
 export interface TopicCluster {
 	entries: ClusterEntry[]
 	/** Peak pairwise similarity inside the cluster — runs process peaks first. */
 	similarity: number
+	/** Similar pairs (edges ≥ threshold) inside the cluster, best first. */
+	pairs: ClusterPair[]
 }
 
 /**
@@ -152,7 +186,9 @@ export function clusterTopics(
 	entries: readonly ClusterEntry[],
 	threshold = CLUSTER_THRESHOLD,
 ): TopicCluster[] {
-	const tokens = entries.map((e) => topicTokens(`${e.title} ${e.description ?? ""} ${e.tags.join(" ")}`))
+	const tokens = entries.map((e) =>
+		topicTokens(`${e.title} ${e.description ?? ""} ${e.tags.join(" ")}`),
+	)
 	const parent = entries.map((_, i) => i)
 	const find = (x: number): number => {
 		while (parent[x] !== x) {
@@ -201,23 +237,117 @@ export function clusterTopics(
 				.sort((a, b) => (degree.get(b) ?? 0) - (degree.get(a) ?? 0))
 				.slice(0, MAX_CLUSTER_SIZE)
 		}
+		// Reuse the clustering edges for the prefilter's pair list: positions map
+		// into the (possibly capped) kept order, best similarity first. Edges
+		// lost to the cap — or transitively-clustered pairs below threshold — are
+		// not pair candidates; a capped cluster with no inner edge left simply
+		// has no pairs (the prefilter then behaves as today).
+		const position = new Map<number, number>()
+		kept.forEach((original, pos) => position.set(original, pos))
+		const pairs: ClusterPair[] = []
+		for (const [key, s] of scores) {
+			const i = Math.floor(key / entries.length)
+			const j = key % entries.length
+			const pi = position.get(i)
+			const pj = position.get(j)
+			if (pi === undefined || pj === undefined) continue
+			pairs.push({ i: pi, j: pj, similarity: s })
+		}
+		pairs.sort((a, b) => b.similarity - a.similarity)
 		clusters.push({
 			entries: kept.map((i) => entries[i] as ClusterEntry),
 			similarity: peak,
+			pairs,
 		})
 	}
 	clusters.sort((a, b) => b.similarity - a.similarity)
 	return clusters
 }
 
-// --- Deprecated-TTL housekeeping (local rule, no model) ----------------------
+// --- Jev prefilter protocol (design 2026-09-25 §2, sweep-aligned) ------------
 
-/** Store plus cache/push hooks the TTL sweep needs (no service dependency). */
-export interface DeprecatedSweeperDeps {
-	store: BundleStore
-	invalidate: () => void
-	schedulePush?: () => void
+// The merge-pair thresholds (band(..., 'mergePair')) are BOUND to the t4
+// threshold-sweep batch protocol: shared state, two-sided criteria, two
+// 600-char side excerpts per question. Absolute scores are protocol-sensitive
+// (t4 §4: the same case scored 0.15 / 0.60 / 0.71 across protocols), so the
+// texts below are copied VERBATIM from
+// .wayfinder/research/t4-labeling-kit/threshold-sweep.mjs (MRG_STATE /
+// MRG_CRITERIA / mrgInstructions) — changing any of them requires a re-sweep
+// of the lines, do not tune in place.
+const PREFILTER_STATE = [
+	"背景：你在为一个个人记忆库做簇内 merge 校准。整理（consolidate）时会把讲同一问题的多个 topic 合并成一份；误并会造成信息丢失，漏并会造成库内冗余与后续漂移。",
+	"判定标准：同一问题指两条记录的是同一件事——同一 bug/特性/任务的不同阶段、两面或后续进展，合并保留一份不丢实质信息。相邻但独立不算：两条各自成立、合并会丢失各自信息（如命名澄清 vs 机制对照、修不同 bug 的相邻提交、不同仓库的两次发版）。",
+].join("\n")
+
+const PAIR_CRITERIA = {
+	true: "同一问题——两条记录的是同一件事的不同阶段/两面/后续进展，合并保留一份不丢实质信息",
+	false:
+		"相邻但独立——各自成立，合并会丢失各自信息（如命名澄清 vs 机制对照、修不同 bug、不同仓库发版）",
 }
+
+// Cluster-level 「值得动吗」 — v1 records it only, never gates (design §2:
+// 簇级问只记不门控，无扫描数据).
+const CLUSTER_CRITERIA = {
+	true: "值得整理——簇内存在值得动作的条目（重复可并、draft 已稳定、已被取代、元数据失准），动作有实质收益",
+	false: "不值得动——条目各自成立，或任何整理动作都不会带来实质收益",
+}
+
+/** Pair question body — the sweep's mrgInstructions: two sides of
+ *  title/tags/conclusion excerpt (ClusterEntry.conclusion is already capped
+ *  at CONCLUSION_SNIPPET_CHARS = the sweep's 600-char protocol). */
+function pairInstructions(a: ClusterEntry, b: ClusterEntry): string {
+	const side = (t: ClusterEntry, name: string): string =>
+		[
+			`## topic ${name}`,
+			`- title: ${t.title}`,
+			`- tags: ${t.tags.join(", ")}`,
+			"- conclusion:",
+			t.conclusion,
+		].join("\n")
+	return [
+		side(a, "A"),
+		"",
+		side(b, "B"),
+		"",
+		"综合以上材料判断：这两个 topic 讲的是同一个问题、应当合并吗？",
+	].join("\n")
+}
+
+/** Cluster-level question body — titles/status/tags only, no conclusions. */
+function clusterInstructions(cluster: TopicCluster): string {
+	const lines = cluster.entries.map(
+		(e) => `- ${e.title}（${e.status}，tags: ${e.tags.join(", ")}）`,
+	)
+	return [
+		"## 候选簇内的 topic",
+		...lines,
+		"",
+		"综合以上材料判断：这一簇值得一次整理动作吗（merge/promote/deprecate/refresh 任一）？",
+	].join("\n")
+}
+
+/**
+ * The prefilter's jev config slice — undefined unless jevEnabled is explicitly
+ * true (default-off master switch: false ⇒ the whole branch is dead code and
+ * today's behavior runs untouched). Optional keys fall back to their
+ * documented defaults (config.ts: the bare-harness DEFAULTS literal predates
+ * them; consumers treat undefined as the default).
+ */
+function jevConfigOf(cfg: Config): JevAskConfig | undefined {
+	if (cfg.jevEnabled !== true) return undefined
+	return {
+		jevBackend: cfg.jevBackend ?? "zen",
+		jevModel: cfg.jevModel ?? "",
+		jevTimeoutMs: cfg.jevTimeoutMs ?? 3000,
+		jevSecretFile: cfg.jevSecretFile ?? "",
+	}
+}
+
+/** The jev seam — injectable so tests run hermetic (same pattern as
+ *  ModelCaller: production never passes it, the real jevAsk is the default). */
+export type JevAsker = typeof jevAsk
+
+// --- Deprecated-TTL housekeeping (local rule, no model) ----------------------
 
 /**
  * Drop `deprecated` topics older than `ttlDays` — pure housekeeping, never
@@ -229,12 +359,12 @@ export interface DeprecatedSweeperDeps {
  * dropped slugs. `ttlDays <= 0` disables the sweep.
  */
 export async function dropExpiredDeprecated(
-	deps: DeprecatedSweeperDeps,
+	service: TopicsService,
 	ttlDays: number,
 	now = Date.now(),
 ): Promise<string[]> {
 	if (!Number.isFinite(ttlDays) || ttlDays <= 0) return []
-	const metas = await deps.store.listTopics()
+	const metas = await service.store.listTopics()
 	const cutoff = now - ttlDays * 86_400_000
 	const dropped: string[] = []
 	for (const m of metas) {
@@ -242,7 +372,7 @@ export async function dropExpiredDeprecated(
 		const at = Date.parse(m.generatedAt)
 		if (!Number.isFinite(at) || at > cutoff) continue
 		try {
-			const removed = await deps.store.deleteTopic(
+			const removed = await service.store.deleteTopic(
 				m.slug,
 				`topics(topic): drop deprecated ${m.slug} (TTL ${ttlDays}d, deprecated ${new Date(at).toISOString().slice(0, 10)})`,
 			)
@@ -252,8 +382,8 @@ export async function dropExpiredDeprecated(
 		}
 	}
 	if (dropped.length > 0) {
-		deps.invalidate()
-		deps.schedulePush?.()
+		service.invalidate()
+		void service.sync?.schedulePush()
 	}
 	return dropped
 }
@@ -266,6 +396,14 @@ interface ClusterOutcome {
 	ops: ConsolidateOp[]
 }
 
+/** Per-cluster prefilter verdict. */
+interface PrefilterOutcome {
+	/** false = every pair missed the adopt band ⇒ the LLM call is skipped. */
+	proceed: boolean
+	/** jev failed or a gate question had no usable score ⇒ fail-open path. */
+	failOpen: boolean
+}
+
 interface AppliedConsolidation {
 	merged: string[]
 	promoted: string[]
@@ -275,37 +413,26 @@ interface AppliedConsolidation {
 	dropped: number
 }
 
-export interface ConsolidatorDeps {
-	store: BundleStore
-	cfg: () => Config
-	saveTopic: SaveTopicFn
-	/** 30-day usage signals per slug (absent map = fresh bundle, no evidence). */
-	usageSignalsSync: () => ReadonlyMap<string, { hits: number; opens: number }>
-	invalidate: () => void
-	/** Optional remote-push hook (GitHub mode), fire-and-forget. */
-	schedulePush?: () => void
-	/** Live caller getter — undefined = lane off (no-model short circuit). */
-	caller: () => TopicCaller | undefined
-}
-
 export class Consolidator {
 	private inFlight: Promise<ConsolidateResult> | undefined
-	private readonly store: BundleStore
-	private readonly cfg: () => Config
-	private readonly saveTopic: SaveTopicFn
-	private readonly usageSignalsSync: () => ReadonlyMap<string, { hits: number; opens: number }>
-	private readonly invalidate: () => void
-	private readonly schedulePush: (() => void) | undefined
-	private readonly caller: () => TopicCaller | undefined
+	private readonly service: TopicsService
+	/** Live caller getter (pi seam) — undefined = lane off (no-model short circuit). */
+	private readonly caller: () => ModelCaller | undefined
+	private readonly askJev: JevAsker
+	/** Best-effort host-logger sink (warn-style); undefined = stay silent,
+	 *  aligned with the lane's quiet discipline for success/no-clusters. */
+	private readonly note: ((message: string) => void) | undefined
 
-	constructor(deps: ConsolidatorDeps) {
-		this.store = deps.store
-		this.cfg = deps.cfg
-		this.saveTopic = deps.saveTopic
-		this.usageSignalsSync = deps.usageSignalsSync
-		this.invalidate = deps.invalidate
-		this.schedulePush = deps.schedulePush
-		this.caller = deps.caller
+	constructor(
+		service: TopicsService,
+		caller: () => ModelCaller | undefined,
+		askJev: JevAsker = jevAsk,
+		note?: (message: string) => void,
+	) {
+		this.service = service
+		this.caller = caller
+		this.askJev = askJev
+		this.note = note
 	}
 
 	get configured(): boolean {
@@ -339,14 +466,17 @@ export class Consolidator {
 	 * or already running. Due = no stamp yet (first run) or the last EVALUATED
 	 * run is older than the cadence.
 	 */
-	async maybeRun(opts: { sessionId?: string; now?: number } = {}): Promise<ConsolidateResult | undefined> {
-		const days = Consolidator.cadenceDays(this.cfg().consolidateCadence)
+	async maybeRun(
+		opts: { sessionId?: string; now?: number } = {},
+	): Promise<ConsolidateResult | undefined> {
+		const days = Consolidator.cadenceDays(this.service.cfg.consolidateCadence)
 		if (days === undefined) return undefined
 		if (this.inFlight !== undefined) return undefined
-		const state = await this.store.readConsolidateState()
+		const state = await this.service.store.readConsolidateState()
 		if (state !== undefined && typeof state.at === "string") {
 			const last = Date.parse(state.at)
-			if (Number.isFinite(last) && (opts.now ?? Date.now()) - last < days * 86_400_000) return undefined
+			if (Number.isFinite(last) && (opts.now ?? Date.now()) - last < days * 86_400_000)
+				return undefined
 		}
 		return this.start(opts.sessionId)
 	}
@@ -367,11 +497,21 @@ export class Consolidator {
 	}
 
 	private async runInner(sessionId?: string): Promise<ConsolidateResult> {
-		const base = { merged: [] as string[], promoted: [] as string[], deprecated: [] as string[], refreshed: [] as string[] }
-		if (this.caller() === undefined) {
-			return { ok: false, reason: "no-model", ...base, detail: "整理 lane 未接线（无模型调用器）" }
+		const base = {
+			merged: [] as string[],
+			promoted: [] as string[],
+			deprecated: [] as string[],
+			refreshed: [] as string[],
 		}
-		const cfg = this.cfg()
+		if (this.caller() === undefined) {
+			return {
+				ok: false,
+				reason: "no-model",
+				...base,
+				detail: "整理 lane 未接线（无模型调用器）",
+			}
+		}
+		const cfg = this.service.cfg
 		if ((cfg.distillModel ?? "") === "") {
 			return {
 				ok: false,
@@ -386,14 +526,36 @@ export class Consolidator {
 			// evaluated, so the stamp stays unset and the next window re-checks.
 			return { ok: false, reason: "no-clusters", ...base }
 		}
-		const applied: AppliedConsolidation = { merged: [], promoted: [], deprecated: [], refreshed: [], actions: [], dropped: 0 }
+		const applied: AppliedConsolidation = {
+			merged: [],
+			promoted: [],
+			deprecated: [],
+			refreshed: [],
+			actions: [],
+			dropped: 0,
+		}
 		let rawOps = 0
 		let calls = 0
 		let evaluated = 0
 		let fatal: "model-error" | "invalid-output" | undefined
 		let failureDetail: string | undefined
+		// jev prefilter (design §2): one cheap System One batch decides whether a
+		// cluster is worth the LLM call at all. undefined = jevEnabled off ⇒ the
+		// whole branch never executes and behavior is exactly as before.
+		const jev = jevConfigOf(this.service.cfg)
+		let prefilterSkipped = 0
 		for (const cluster of clusters) {
 			if (calls >= MAX_MODEL_CALLS_PER_RUN) break
+			if (jev !== undefined) {
+				const pf = await this.prefilterCluster(jev, cluster)
+				if (!pf.proceed) {
+					prefilterSkipped += 1
+					this.note?.(
+						`topics consolidate: 前置过滤跳过簇（pair 均未达 adopt 线）：${cluster.entries.map((e) => e.slug).join("、")}`,
+					)
+					continue
+				}
+			}
 			const outcome = await this.runCluster(sessionId, cluster)
 			calls += 1
 			if (outcome.fatal !== undefined) {
@@ -403,10 +565,21 @@ export class Consolidator {
 			}
 			evaluated += 1
 			rawOps += outcome.ops.length
-			if (applied.merged.length + applied.promoted.length + applied.deprecated.length + applied.refreshed.length >= MAX_OPS_PER_RUN) {
+			if (
+				applied.merged.length +
+					applied.promoted.length +
+					applied.deprecated.length +
+					applied.refreshed.length >=
+				MAX_OPS_PER_RUN
+			) {
 				break
 			}
-			const room = MAX_OPS_PER_RUN - (applied.merged.length + applied.promoted.length + applied.deprecated.length + applied.refreshed.length)
+			const room =
+				MAX_OPS_PER_RUN -
+				(applied.merged.length +
+					applied.promoted.length +
+					applied.deprecated.length +
+					applied.refreshed.length)
 			const result = await this.applyOps(outcome.ops.slice(0, room), cluster)
 			applied.merged.push(...result.merged)
 			applied.promoted.push(...result.promoted)
@@ -415,12 +588,17 @@ export class Consolidator {
 			applied.actions.push(...result.actions)
 			applied.dropped += result.dropped
 		}
-		const progress = applied.merged.length + applied.promoted.length + applied.deprecated.length + applied.refreshed.length > 0
+		const progress =
+			applied.merged.length +
+				applied.promoted.length +
+				applied.deprecated.length +
+				applied.refreshed.length >
+			0
 		// The stamp advances only when the model actually evaluated something —
 		// a run that died on its first call retries at the next session start.
 		let stampNote = ""
 		if (evaluated > 0) {
-			await this.store
+			await this.service.store
 				.writeConsolidateState({
 					at: new Date().toISOString(),
 					ok: !fatal,
@@ -447,12 +625,13 @@ export class Consolidator {
 		const tail = [
 			applied.dropped > 0 ? `丢弃 ${applied.dropped} 个无效 op` : undefined,
 			`${calls} 次模型调用（评估 ${evaluated} 簇 / 候选 ${clusters.length} 簇）`,
+			prefilterSkipped > 0 ? `前置过滤跳过 ${prefilterSkipped} 簇` : undefined,
 			fatal !== undefined ? `中途失败：${failureDetail ?? "unknown"}` : undefined,
 			stampNote === "" ? undefined : stampNote.replace(/^；/, ""),
 		]
 			.filter(Boolean)
 			.join("；")
-		this.schedulePush?.()
+		void this.service.sync?.schedulePush()
 		return {
 			ok: evaluated > 0,
 			...(fatal !== undefined && evaluated === 0 ? { reason: fatal } : {}),
@@ -470,11 +649,12 @@ export class Consolidator {
 
 	/** Read the active pool and cluster it lexically. */
 	private async buildClusters(): Promise<TopicCluster[]> {
-		const metas = await this.store.listTopics()
+		const metas = await this.service.store.listTopics()
+		const usage = this.service.usageSignalsSync()
 		const entries: ClusterEntry[] = []
 		for (const m of metas) {
 			if (m.status === "deprecated") continue
-			const doc = await this.store.readTopic(m.slug).catch(() => undefined)
+			const doc = await this.service.store.readTopic(m.slug).catch(() => undefined)
 			if (doc === undefined) continue
 			entries.push({
 				slug: m.slug,
@@ -490,17 +670,121 @@ export class Consolidator {
 		return clusterTopics(entries).slice(0, MAX_MODEL_CALLS_PER_RUN)
 	}
 
+	/**
+	 * One jev request per cluster (design 2026-09-25 §2 整理 lane 前置). The
+	 * top-k similar pairs (k ≤ {@link PREFILTER_TOP_PAIRS}, edges reused from
+	 * clustering) each get a pair noul question 「同一问题吗」; one record-only
+	 * cluster-level 「值得动吗」 rides along (固定 band='record', never gates).
+	 * Gate: ≥1 pair in the adopt band → the cluster goes to the LLM; all pairs
+	 * below → skipped (省调用). Any jev failure proceeds fail-open — the
+	 * call-layer telemetry row (outcome !== 'ok' marks the fail-open) was already written by jevAsk
+	 * itself; only the verdict layer is ours here (agree='n/a', nothing lexical
+	 * to reconcile against on this lane).
+	 */
+	private async prefilterCluster(
+		jev: JevAskConfig,
+		cluster: TopicCluster,
+	): Promise<PrefilterOutcome> {
+		const pairs = cluster.pairs.slice(0, PREFILTER_TOP_PAIRS)
+		// No local similarity evidence (e.g. a capped cluster whose edges all
+		// fell outside) — behave exactly as today, zero jev calls.
+		if (pairs.length === 0) return { proceed: true, failOpen: false }
+		const questions: Record<string, JevQuestion> = {}
+		interface QuestionMeta {
+			questionId: string
+			ref: string
+			instructions: string
+			/** Pair questions gate; the cluster-level question records only. */
+			gating: boolean
+		}
+		const metas: QuestionMeta[] = []
+		pairs.forEach((p, idx) => {
+			const a = cluster.entries[p.i]
+			const b = cluster.entries[p.j]
+			const instructions = pairInstructions(a, b)
+			const questionId = `p${idx + 1}`
+			questions[questionId] = { type: "noul", instructions, criteria: PAIR_CRITERIA }
+			metas.push({
+				questionId,
+				ref: `pair:${a.slug}|${b.slug}`,
+				instructions,
+				gating: true,
+			})
+		})
+		const clusterQuestion = clusterInstructions(cluster)
+		questions["cluster"] = {
+			type: "noul",
+			instructions: clusterQuestion,
+			criteria: CLUSTER_CRITERIA,
+		}
+		metas.push({
+			questionId: "cluster",
+			ref: `cluster:${cluster.entries[0]?.slug ?? ""}`,
+			instructions: clusterQuestion,
+			gating: false,
+		})
+
+		const r = await this.askJev({
+			state: PREFILTER_STATE,
+			questions,
+			config: jev,
+			lane: "consolidate-prefilter",
+			fallback: false,
+			// fallback stays FALSE at call time (jevAsk writes before the outcome
+			// is known); fail-open occurrence = outcome !== 'ok' — this lane's
+			// "cluster goes to the LLM as today" is deterministic per ADR 0018.
+		})
+		if (!r.ok) return { proceed: true, failOpen: true }
+		const at = new Date().toISOString()
+		const recs: JevVerdictRecord[] = []
+		let adopt = false
+		let failOpen = false
+		for (const meta of metas) {
+			// Answer shape per the sweep protocol: noul answers carry the
+			// probability on the `noul` field; anything else is unusable.
+			const raw = (r.answers[meta.questionId] as { noul?: unknown } | undefined)?.noul
+			if (typeof raw !== "number" || !Number.isFinite(raw)) {
+				// A gate question without a usable score must never veto the cluster.
+				if (meta.gating) failOpen = true
+				continue
+			}
+			const probability = Math.min(1, Math.max(0, raw))
+			const verdictBand: JevBand = meta.gating ? band(probability, "mergePair") : "record"
+			if (verdictBand === "adopt") adopt = true
+			recs.push({
+				at,
+				lane: "consolidate-prefilter",
+				questionId: meta.questionId,
+				qtype: "noul",
+				ref: meta.ref,
+				digest: digestFor(PREFILTER_STATE, meta.questionId, meta.instructions),
+				probability,
+				band: verdictBand,
+				agree: "n/a",
+			})
+		}
+		await logVerdicts(recs)
+		if (failOpen) return { proceed: true, failOpen: true }
+		return { proceed: adopt, failOpen: false }
+	}
+
 	/** One model call over one cluster, ops shape-validated but not yet applied. */
-	private async runCluster(sessionId: string | undefined, cluster: TopicCluster): Promise<ClusterOutcome> {
+	private async runCluster(
+		sessionId: string | undefined,
+		cluster: TopicCluster,
+	): Promise<ClusterOutcome> {
 		const caller = this.caller()
-		if (caller === undefined) return { ops: [], fatal: "model-error", detail: "consolidate caller unavailable" }
-		const usage = this.usageSignalsSync()
+		if (caller === undefined)
+			return { ops: [], fatal: "model-error", detail: "consolidate caller unavailable" }
+		const usage = this.service.usageSignalsSync()
 		// The aggregate map only keys slugs WITH signals — but "0 hits in 30d" is
 		// exactly the gardening evidence the guardrail sentence talks about. When
 		// the logs are non-empty, absence from the map IS a measured zero; when
 		// they're empty (fresh bundle) the fields stay absent rather than lying.
 		const usageKnown = usage.size > 0
-		const usageOf = (slug: string): { injections30d: number; opens30d: number } | undefined => {
+		const usageOf = (
+			slug: string,
+		): { injections30d: number; opens30d: number } | undefined => {
 			if (!usageKnown) return undefined
 			const u = usage.get(slug)
 			return { injections30d: u?.hits ?? 0, opens30d: u?.opens ?? 0 }
@@ -521,27 +805,37 @@ export class Consolidator {
 			`候选簇（${payload.length} 条可能相近的 topic）：`,
 			JSON.stringify(payload),
 			"",
-			"请输出整理结果（严格 JSON，{\"ops\":[...]}）；没有值得整理的就输出 {\"ops\":[]}：",
+			'请输出整理结果（严格 JSON，{"ops":[...]}）；没有值得整理的就输出 {"ops":[]}：',
 		].join("\n")
 		let raw: string
 		try {
 			raw = await caller({
 				system: CONSOLIDATE_SYSTEM_PROMPT,
 				user,
+				purpose: "topics-consolidate",
+				sessionId,
 				maxTokens: CONSOLIDATE_MAX_TOKENS,
 			})
 		} catch (e) {
-			return { ops: [], fatal: "model-error", detail: String(e instanceof Error ? e.message : e).slice(0, 200) }
+			return {
+				ops: [],
+				fatal: "model-error",
+				detail: String(e instanceof Error ? e.message : e).slice(0, 200),
+			}
 		}
 		let ops: ConsolidateOp[]
 		try {
 			// parseOps extracts the first balanced {"ops":[...]} and filters
 			// non-object entries; the per-op shape re-validation happens in
-			// applyOps (a consolidate op carries different fields than a
+			// sanitizeOps (a consolidate op carries different fields than a
 			// distill op, so nothing here trusts the cast).
 			ops = parseOps(raw) as unknown as ConsolidateOp[]
 		} catch (e) {
-			return { ops: [], fatal: "invalid-output", detail: String(e instanceof Error ? e.message : e).slice(0, 200) }
+			return {
+				ops: [],
+				fatal: "invalid-output",
+				detail: String(e instanceof Error ? e.message : e).slice(0, 200),
+			}
 		}
 		return { ops }
 	}
@@ -553,20 +847,40 @@ export class Consolidator {
 	 * slugs already merged away earlier in this run are skipped (the deprecation
 	 * already redirects readers to the survivor). One bad op never sinks the rest.
 	 */
-	private async applyOps(ops: readonly ConsolidateOp[], cluster: TopicCluster): Promise<AppliedConsolidation> {
-		const applied: AppliedConsolidation = { merged: [], promoted: [], deprecated: [], refreshed: [], actions: [], dropped: 0 }
+	private async applyOps(
+		ops: readonly ConsolidateOp[],
+		cluster: TopicCluster,
+	): Promise<AppliedConsolidation> {
+		const applied: AppliedConsolidation = {
+			merged: [],
+			promoted: [],
+			deprecated: [],
+			refreshed: [],
+			actions: [],
+			dropped: 0,
+		}
 		const clusterSlugs = new Set(cluster.entries.map((e) => e.slug))
 		for (const op of ops) {
 			try {
-				if (applied.merged.length + applied.promoted.length + applied.deprecated.length + applied.refreshed.length >= MAX_OPS_PER_RUN) break
+				if (
+					applied.merged.length +
+						applied.promoted.length +
+						applied.deprecated.length +
+						applied.refreshed.length >=
+					MAX_OPS_PER_RUN
+				)
+					break
 				if (typeof op !== "object" || op === null) {
 					applied.dropped += 1
 					continue
 				}
 				if (op.op === "merge") {
-					const survivor = typeof op.survivor === "string" ? okf.slugify(op.survivor) : undefined
+					const survivor =
+						typeof op.survivor === "string" ? okf.slugify(op.survivor) : undefined
 					const mergedRaw = Array.isArray(op.merged) ? op.merged : []
-					const merged = mergedRaw.filter((s): s is string => typeof s === "string").map((s) => okf.slugify(s))
+					const merged = mergedRaw
+						.filter((s): s is string => typeof s === "string")
+						.map((s) => okf.slugify(s))
 					if (
 						survivor === undefined ||
 						survivor === "" ||
@@ -580,24 +894,27 @@ export class Consolidator {
 						applied.dropped += 1
 						continue
 					}
-					const survivorDoc = await this.store.readTopic(survivor)
+					const survivorDoc = await this.service.store.readTopic(survivor)
 					if (survivorDoc === undefined) {
 						applied.dropped += 1
 						continue
 					}
-					await this.saveTopic({
+					await this.service.saveTopic({
 						slug: survivor,
-						title: typeof op.title === "string" && op.title.trim() !== "" ? op.title : survivorDoc.fm.title,
+						title:
+							typeof op.title === "string" && op.title.trim() !== ""
+								? op.title
+								: survivorDoc.fm.title,
 						description: op.description,
 						tags: op.tags,
 						conclusion: op.conclusion,
 					})
 					for (const slug of merged) {
-						const doc = await this.store.readTopic(slug)
+						const doc = await this.service.store.readTopic(slug)
 						if (doc === undefined) continue
 						const original = okf.sectionOf(doc.body, okf.CONCLUSION_HEADING) ?? ""
 						const pointer = `> 已并入 topics/${survivor}.md（consolidation ${new Date().toISOString().slice(0, 10)}${op.reason ? `：${op.reason}` : ""}）。以下结论保留作历史参考。`
-						await this.saveTopic({
+						await this.service.saveTopic({
 							slug,
 							title: doc.fm.title,
 							conclusion: `${pointer}\n\n${original}`.trim(),
@@ -605,19 +922,27 @@ export class Consolidator {
 						})
 					}
 					applied.merged.push(survivor)
-					applied.actions.push({ kind: "merge", slug: survivor, merged, reason: op.reason })
+					applied.actions.push({
+						kind: "merge",
+						slug: survivor,
+						merged,
+						reason: op.reason,
+					})
 				} else if (op.op === "promote" || op.op === "deprecate") {
 					const slug = typeof op.slug === "string" ? okf.slugify(op.slug) : undefined
 					if (slug === undefined || slug === "" || !clusterSlugs.has(slug)) {
 						applied.dropped += 1
 						continue
 					}
-					const doc = await this.store.readTopic(slug)
-					if (doc === undefined || doc.fm.status === (op.op === "promote" ? "stable" : "deprecated")) {
+					const doc = await this.service.store.readTopic(slug)
+					if (
+						doc === undefined ||
+						doc.fm.status === (op.op === "promote" ? "stable" : "deprecated")
+					) {
 						applied.dropped += 1
 						continue
 					}
-					await this.saveTopic({
+					await this.service.saveTopic({
 						slug,
 						title: doc.fm.title,
 						status: op.op === "promote" ? "stable" : "deprecated",
@@ -631,7 +956,7 @@ export class Consolidator {
 						applied.dropped += 1
 						continue
 					}
-					const doc = await this.store.readTopic(slug)
+					const doc = await this.service.store.readTopic(slug)
 					if (doc === undefined) {
 						applied.dropped += 1
 						continue
@@ -651,9 +976,12 @@ export class Consolidator {
 						applied.dropped += 1
 						continue
 					}
-					await this.saveTopic({
+					await this.service.saveTopic({
 						slug,
-						title: typeof op.title === "string" && op.title.trim() !== "" ? op.title : doc.fm.title,
+						title:
+							typeof op.title === "string" && op.title.trim() !== ""
+								? op.title
+								: doc.fm.title,
 						description: op.description,
 						tags: op.tags,
 						triggers: op.triggers,

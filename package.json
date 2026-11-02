@@ -1,6 +1,6 @@
 {
   "name": "@aiwayds/pi-topic-memory",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "OKF v0.2 topic memory for the pi coding agent: a local git-tracked knowledge bundle (~/.pi/agent/topics) with observe -> distill -> consolidate lanes, zero-LLM hot-path injection (pointer/digest, budgeted), five topic_* model tools, and the /topics command family. Ported from the author's dsh-topics-memory.",
   "type": "module",
   "license": "Apache-2.0",
@@ -50,7 +50,15 @@
     "commands.ts",
     "CHANGELOG.md",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "embedding.ts",
+    "pipeline-events.ts",
+    "jev/backends.ts",
+    "jev/thresholds.ts",
+    "jev/gate.ts",
+    "jev/client.ts",
+    "jev/log.ts",
+    "jev/dual.ts"
   ],
   "scripts": {
     "smoke": "node smoke-test.cjs",

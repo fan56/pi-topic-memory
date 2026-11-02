@@ -23,7 +23,8 @@ import type { DistillResult } from "./distill";
 import type { ConsolidateResult } from "./consolidate";
 import { buildGraph, renderGraphHtml, renderNearMissSparkline } from "./viz";
 import { CONFIG_KEYS, displayKey, parseConfigValue, saveConfigKey, type ConfigKey } from "./config";
-import { aggregateStats, type AggregateStats } from "./ilog";
+import { aggregateStats, aggregateOpenPanel, ZERO_OPEN_MIN_INJECTIONS, type AggregateStats } from "./ilog";
+import { reloadSecrets } from "./jev/gate";
 
 /** Read-only observer-lane view, wired by the integrator (optional). */
 export interface ObserverStatus {
@@ -180,6 +181,32 @@ async function renderStatus(deps: TopicsCommandDeps): Promise<string> {
 		["蒸馏", cfg.distillModel !== "" ? `${cfg.distillModel}，每 ${cfg.distillEveryTurns} 轮` : "未配置模型（/topics set distill-model provider/model）"],
 		["整理", cadenceLabel(cfg.consolidateCadence) + (cfg.consolidateCadence === "off" ? "" : `（复用蒸馏模型，/topics consolidate 立即跑）`)],
 	];
+	// Fast-lane heartbeat (dsh 0.17.x observability): pair "observer lane
+	// recorded recently" with "no injection round for >48h" — exactly the
+	// asymmetry a silent fast-lane death produces. With autoInject off there
+	// is no fast lane to be stale.
+	if (cfg.autoInject) {
+		const HOUR = 3_600_000;
+		const hb = await service.store.readLaneHeartbeat();
+		const stamp = (iso: string): string => cell(iso.slice(0, 19).replace("T", " "));
+		const ago = (ms: number): string => {
+			const h = ms / HOUR;
+			if (!Number.isFinite(h)) return "";
+			return h < 1 ? `${Math.max(1, Math.round(h * 60))} 分钟前` : h < 48 ? `${Math.round(h)}h 前` : `${Math.round(h / 24)} 天前`;
+		};
+		const lastAt = hb.lastInjectionAt;
+		const fastIdleMs = lastAt !== undefined ? Date.now() - Date.parse(lastAt) : Number.POSITIVE_INFINITY;
+		const obsAgeMs = hb.lastObservationAt !== undefined ? Date.now() - Date.parse(hb.lastObservationAt) : Number.POSITIVE_INFINITY;
+		const obsRecent = obsAgeMs < 24 * HOUR;
+		if (lastAt === undefined) {
+			rows.push(["快道心跳", obsRecent ? `⚠️ 从未注入，但观察 lane ${ago(obsAgeMs)}仍在记录——快道疑似静默死亡` : "从未注入"]);
+		} else if (fastIdleMs > 48 * HOUR && obsRecent) {
+			rows.push(["快道心跳", `⚠️ ${stamp(lastAt)}（${ago(fastIdleMs)}）无注入轮次，而观察 lane ${ago(obsAgeMs)}仍在记录——快道疑似静默死亡`]);
+		} else {
+			const since = ago(fastIdleMs);
+			rows.push(["快道心跳", `${stamp(lastAt)}${since === "" ? "" : `（${since}）`}`]);
+		}
+	}
 	// pi-side addition (optional seam): observer lane readout, only when the
 	// integrator wired the hook — dsh had no such row.
 	const observer = deps.observerState?.();
@@ -337,20 +364,14 @@ async function renderStats(service: TopicsService): Promise<string> {
 		}
 		lines.push(`| 慢道参与轮 | ${slowRounds}（快 ${records.length - slowRounds} / 慢或混合 ${slowRounds}${medianLag}） |`);
 	}
-	// Pointer open rate (v4 §4.3): topic_open calls vs pointer entries injected.
-	// Echoed hits ride the retrieval but never became pointers — excluded here.
+	// Injection-vs-open metrics (dsh v5): the denominator counts only pointers
+	// that truly rendered (deduped/echoed/dropped all excluded, slow pointers
+	// included) and the numerator only counts DISTINCT slugs from that
+	// rendered set opened inside the injection window — search opens and
+	// never-rendered slugs cannot inflate the rate.
 	const opens = await service.store.readOpenRecords();
-	if (opens.length > 0 || records.some((r) => r.lane !== undefined)) {
-		const entries = records.reduce(
-			(acc, r) =>
-				acc +
-				r.hits.filter((h) => !(r.deduped ?? []).includes(h.slug) && !(r.echoed ?? []).includes(h.slug)).length +
-				(r.slow?.length ?? 0),
-			0,
-		);
-		const rate = entries === 0 ? 0 : Math.min(1, opens.length / entries);
-		lines.push(`| 指针打开率 | ${(rate * 100).toFixed(1)}%（${opens.length} 次 topic_open / ${entries} 条注入指针） |`);
-	}
+	const panel = aggregateOpenPanel(records, opens);
+	lines.push(`| open rate | ${(panel.openRate * 100).toFixed(1)}%（${panel.opensInWindow} 个被打开指针 / ${panel.pointerEntries} 条注入指针） |`);
 	const echoedCount = records.reduce((acc, r) => acc + (r.echoed?.length ?? 0), 0);
 	if (echoedCount > 0) {
 		lines.push(`| 回声抑制 | ${echoedCount} 次（本会话蒸馏出的 topic 不回注） |`);
@@ -358,6 +379,31 @@ async function renderStats(service: TopicsService): Promise<string> {
 	if (stats.topTopics.length > 0) {
 		lines.push("", "Top-N 被注入 Topic：", "", "| Slug | 注入次数 |", "| --- | --- |");
 		for (const t of stats.topTopics.slice(0, 5)) lines.push(`| \`${cell(t.slug)}\` | ${t.count} |`);
+	}
+	// ---- 注入 vs 打开 panel ----
+	// Per-topic cut: what the header's windowed rate cannot show — which
+	// topics the model actually bothers to open (wide-scope slug attribution).
+	if (panel.topics.length > 0) {
+		lines.push(
+			"",
+			"注入 vs 打开（Top-10，注入=真正渲染的指针；打开按 slug 归因，全窗口）：",
+			"",
+			"| Topic | 注入 | 打开 | 打开率 |",
+			"| --- | --- | --- | --- |",
+			...panel.topics.map((t) => `| \`${cell(t.slug)}\` | ${t.injections} | ${t.opens} | ${(t.openRate * 100).toFixed(1)}% |`),
+		);
+	}
+	if (panel.zeroOpenTotal > 0) {
+		const shown = panel.zeroOpen.map((z) => `\`${cell(z.slug)}\``).join("、");
+		const more = panel.zeroOpenTotal > panel.zeroOpen.length ? `（共 ${panel.zeroOpenTotal} 个）` : "";
+		lines.push("", `零打开高频（注入 ≥${ZERO_OPEN_MIN_INJECTIONS}、打开 0）：${shown}${more}`);
+	}
+	lines.push("", panel.hasSourceData ? `打开来源：pointer ${panel.pointerOpens} / search ${panel.searchOpens}` : "打开来源：暂无来源数据（需新版本 open 记录）");
+	if (panel.pointerEntries > 0) {
+		lines.push("", "| 分桶 | 指针 | 打开率 |", "| --- | --- | --- |");
+		for (const b of panel.bands) {
+			lines.push(`| ${b.label} | ${b.pointers} | ${b.pointers === 0 ? "—" : `${(b.openRate * 100).toFixed(1)}%`} |`);
+		}
 	}
 	if (stats.nearMissHistogram.length > 0) {
 		lines.push(
@@ -547,6 +593,9 @@ async function doSet(service: TopicsService, tokens: string[]): Promise<CommandO
 	if (typeof parsed === "object" && parsed !== null && "error" in parsed) return fail(parsed.error);
 	await saveConfigKey(service.store.root, key, parsed);
 	if (key === "repo" || key === "autoInject") service.invalidate();
+	// The outbound secret gate keeps an in-process literal cache — swapping
+	// jevSecretFile must force a re-read (dsh v0.22 parity).
+	if (key === "jevSecretFile") reloadSecrets(String(parsed)); // hot-swapped list: force re-read
 	return ok(`✅ topics.${displayKey(key)} = ${String(parsed)}`);
 }
 
@@ -991,12 +1040,13 @@ async function topicDetail(ctx: ExtensionCommandContext, deps: TopicsCommandDeps
 			// description passed explicitly: saveTopic only preserves caller-passed
 			// frontmatter fields, and the stored description must survive a
 			// status-only edit.
+			// Commit message is service-composed (dsh v0.25 parity:
+			// `topics(topic): update <slug>`); the field diff carries the rest.
 			await service.saveTopic({
 				title: doc.fm.title,
 				slug,
 				status: st === "draft" || st === "stable" || st === "deprecated" ? st : undefined,
 				description: doc.fm.description,
-				message: `topics(topic): ${slug} status -> ${st}`,
 			});
 			ctx.ui.notify(`topics(topic): ${slug} status -> ${st}`, "info");
 			continue;
@@ -1015,7 +1065,6 @@ async function topicDetail(ctx: ExtensionCommandContext, deps: TopicsCommandDeps
 				slug,
 				conclusion: trimmed,
 				description: doc.fm.description,
-				message: `topics(topic): ${slug} edit conclusion`,
 			});
 			ctx.ui.notify(`topics(topic): ${slug} conclusion updated`, "info");
 			continue;

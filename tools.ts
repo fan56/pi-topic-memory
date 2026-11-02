@@ -14,10 +14,13 @@
 
 import { Type } from "typebox";
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { OpenResult, TopicsService } from "./service";
+import type { TopicsService } from "./service";
 import type { BundleStore } from "./store";
 import type { Config } from "./config";
 import type { Sync } from "./sync";
+
+/** topic_open payload — the service's own return shape (dsh HEAD parity). */
+type OpenDetails = Awaited<ReturnType<TopicsService["openTopic"]>>;
 
 /** Injection deps — `service` is the required seam; the rest are optional
  *  handles the integrator may pass for parity/debug (service already exposes
@@ -128,9 +131,9 @@ export function registerTopicTools(pi: ExtensionAPI, deps: TopicToolsDeps): void
 		parameters: Type.Object({
 			slug: Type.String({ description: "Topic slug (from a pointer or topic_search)" }),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<OpenResult | ToolErrorDetails>> {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<OpenDetails | ToolErrorDetails>> {
 			try {
-				const value = await service.recordOpen(params.slug, ctx.sessionManager.getSessionId());
+				const value = await service.openTopic(params.slug, ctx.sessionManager.getSessionId());
 				if (!value.found) {
 					return {
 						content: [{ type: "text" as const, text: `Topic \`${value.slug}\` 不存在（可能已合并或改名；用 topic_search 找）。` }],
@@ -167,7 +170,7 @@ export function registerTopicTools(pi: ExtensionAPI, deps: TopicToolsDeps): void
 		}),
 		async execute(_toolCallId, params): Promise<AgentToolResult<SearchDetails | ToolErrorDetails>> {
 			try {
-				const outcome = await service.searchTopics(params.query, { topK: params.top_k });
+				const outcome = await service.search(params.query, params.top_k);
 				const roster = new Map((await service.roster()).map((r) => [r.slug, r]));
 				const docs = await Promise.all(
 					outcome.hits.map(async (h) => {

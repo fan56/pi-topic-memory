@@ -6,6 +6,13 @@
  * and the injection log are JSONL sidecars under `meta/`; they are committed
  * on the flush cadence (sync layer), not per append.
  *
+ * Ported from dsh-topics-memory/src/store.ts (dsh v0.25.1). Deviations: dsh
+ * ADR references qualified as "dsh ADR 000x"; default stamped actor is
+ * `agent:pi-topic-memory@<host>` (pi paths.ts actorFor); the 「指针打开率」
+ * comment renders in English ("pointer-open-rate"); `saveTopic` opts gains
+ * `generatedAt?: string` (pi migrate.ts replays legacy timestamps; default
+ * `new Date().toISOString()` = dsh behavior).
+ *
  * @module store
  */
 
@@ -18,6 +25,7 @@ import {
 	appendFile,
 	access,
 	rm,
+	copyFile,
 } from "node:fs/promises"
 import { readFileSync } from "node:fs"
 import { constants as FsConstants } from "node:fs"
@@ -26,7 +34,7 @@ import { randomUUID } from "node:crypto"
 import * as okf from "./okf"
 import * as gitmod from "./git"
 import { actorFor } from "./paths"
-import type { InjectionRecord } from "./ilog"
+import type { InjectionRecord, OpenRecord } from "./ilog"
 
 export interface TopicMeta {
 	slug: string
@@ -38,19 +46,35 @@ export interface TopicMeta {
 	generatedAt: string
 }
 
-export type ObservationKind = "decision" | "finding" | "constraint" | "question" | "turn"
+/** Bundle entry kinds (B2, spec §6.5 落点表: store kind 枚举). Canonical
+ *  model lives in okf.ts next to TopicStatus; re-exported here as the store
+ *  surface the spec anchors on. */
+export type TopicKind = okf.TopicKind
+export const topicKindOf = okf.topicKindOf
+
+export type ObservationKind =
+	"decision" | "finding" | "constraint" | "question" | "turn" | "signal"
+
+/**
+ * Where an observation came from. `fed` marks entries that arrived through
+ * the feedObservations write seam (B-line dual-write, spec 卷二 §6.2) — the
+ * provenance marker the distill lane and audits key on.
+ */
+export type ObservationSource = "model" | "auto" | "fed"
 
 export interface Observation {
 	id: string
 	at: string
 	kind: ObservationKind
-	source: "model" | "auto"
+	source: ObservationSource
 	text: string
 	sessionId?: string
 	distilled: boolean
 	distilledInto?: string[]
 	/** Failed distill attempts: fed to the model but consumed by no op (GC counter). */
 	attempts?: number
+	/** Write-seam audit: the feedObservations caller identity (opts.actor). */
+	by?: string
 }
 
 export interface SaveResult {
@@ -92,6 +116,15 @@ function dedupePaths(paths: readonly string[]): string[] {
 function sameStrings(a: readonly string[], b: readonly string[]): boolean {
 	return a.length === b.length && a.every((v, i) => v === b[i])
 }
+
+/**
+ * Body heading for caller-supplied semantic links (A2). Links are rendered as
+ * `[[wikilinks]]` under this section so the EXISTING link-edge machinery
+ * (okf.bodyLinkSlugs → computeBacklinks → retrieval graph walk) indexes them
+ * as `via: 'link'` edges — the edge representation gains no new type; the
+ * body landing spot is what makes them first-class links for free.
+ */
+const LINKS_HEADING = "Links"
 
 export interface BundleStoreOptions {
 	/** Override the stamped actor (tests). Defaults to `agent:pi-topic-memory@<host>`. */
@@ -140,6 +173,34 @@ export class BundleStore {
 		return join(this.metaDir(), "injections.jsonl")
 	}
 
+	/**
+	 * Fast-lane heartbeat (0.17.0): tail timestamps of the two lane sidecars —
+	 * the last injection round (`injections.jsonl`) and the last observation
+	 * (`observations.jsonl`). Feeds the /topics status stale check that makes
+	 * "observer still recording, injection lane silently dead" visible within
+	 * a day instead of weeks (the 0.1.5-rc.2 claim-order incident shape).
+	 * Full-file reads are fine here: /topics status is interactive and both
+	 * logs are append-per-round small; unreadable logs degrade to undefined.
+	 */
+	async readLaneHeartbeat(): Promise<{
+		lastInjectionAt?: string
+		lastObservationAt?: string
+	}> {
+		const tailAt = async (file: string): Promise<string | undefined> => {
+			try {
+				const lines = (await readFile(file, "utf8")).trimEnd().split("\n")
+				const at = (JSON.parse(lines.at(-1) ?? "") as { at?: unknown }).at
+				return typeof at === "string" ? at : undefined
+			} catch {
+				return undefined
+			}
+		}
+		return {
+			lastInjectionAt: await tailAt(this.injectionsPath()),
+			lastObservationAt: await tailAt(this.observationsPath()),
+		}
+	}
+
 	private conflictsPath(): string {
 		return join(this.metaDir(), "conflicts.json")
 	}
@@ -156,7 +217,10 @@ export class BundleStore {
 
 	async readDistillState(): Promise<Record<string, unknown> | undefined> {
 		try {
-			return JSON.parse(await readFile(this.distillStatePath(), "utf8")) as Record<string, unknown>
+			return JSON.parse(await readFile(this.distillStatePath(), "utf8")) as Record<
+				string,
+				unknown
+			>
 		} catch {
 			return undefined
 		}
@@ -174,7 +238,10 @@ export class BundleStore {
 
 	async readConsolidateState(): Promise<Record<string, unknown> | undefined> {
 		try {
-			return JSON.parse(await readFile(this.consolidateStatePath(), "utf8")) as Record<string, unknown>
+			return JSON.parse(await readFile(this.consolidateStatePath(), "utf8")) as Record<
+				string,
+				unknown
+			>
 		} catch {
 			return undefined
 		}
@@ -305,7 +372,10 @@ export class BundleStore {
 			}
 			if (changed.length === 0) return
 			await this.regenerateIndex()
-			await this.commit([...changed, "index.md"], `topics(migrate): repair wrapped depends entries in ${changed.length} topic file(s)`)
+			await this.commit(
+				[...changed, "index.md"],
+				`topics(migrate): repair wrapped depends entries in ${changed.length} topic file(s)`,
+			)
 		})
 	}
 
@@ -323,11 +393,20 @@ export class BundleStore {
 	 * Write a topic (atomic), regenerate the index, and commit both — one
 	 * commit per conclusion change (dsh ADR 0003). `slug` in the doc's depends
 	 * is NOT normalized here; callers pass bundle-relative paths.
+	 *
 	 * `opts.generatedAt` overrides the stamped `generated.at` (migration keeps
 	 * the legacy lastUpdated instead of the wall clock); the default is now.
+	 *
+	 * `links` (A2, optional): whitelist-surviving semantic targets from the
+	 * distill lane. Applied INSIDE this one write transaction — the topic and
+	 * its edges land together (先落 topic 再建边); the Links section lands as
+	 * body wikilinks and the index/backlinks regeneration below (same
+	 * transaction) recomputes the edge index over them. Normalized and
+	 * self/dedup-guarded here too, so any caller benefits from the same guard
+	 * the distill lane already ran.
 	 */
 	async saveTopic(
-		input: { slug: string; doc: okf.TopicDoc },
+		input: { slug: string; doc: okf.TopicDoc; links?: readonly string[] },
 		opts: { message: string; actor?: string; created?: boolean; generatedAt?: string },
 	): Promise<SaveResult> {
 		return this.enqueue(async () => {
@@ -335,9 +414,27 @@ export class BundleStore {
 			const file = this.topicPath(slug)
 			const created = opts.created ?? !(await existsSync(file))
 			const now = opts.generatedAt ?? new Date().toISOString()
+			let body = input.doc.body
+			if (input.links !== undefined && input.links.length > 0) {
+				const targets: string[] = []
+				for (const raw of input.links) {
+					if (typeof raw !== "string") continue
+					const target = okf.normalizeLinkTarget(raw)
+					if (target === undefined || target === slug || targets.includes(target))
+						continue
+					targets.push(target)
+				}
+				if (targets.length > 0) {
+					body = okf.setSection(
+						body,
+						LINKS_HEADING,
+						targets.map((t) => `- [[${t}]]`).join("\n"),
+					)
+				}
+			}
 			const doc: okf.TopicDoc = {
 				fm: { ...input.doc.fm, generated: { by: opts.actor ?? this.actor, at: now } },
-				body: input.doc.body,
+				body,
 			}
 			const raw = okf.serializeTopicDoc(doc)
 			await atomicWrite(file, raw)
@@ -365,6 +462,36 @@ export class BundleStore {
 		})
 	}
 
+	/**
+	 * Lesson removal seam (B2/卷二 §6.2 MJ-B, spec 红线④): archive BEFORE the
+	 * roster removal — the file is copied byte-exact to `archive/lessons/`
+	 * inside the bundle and only then deleted from `topics/`, both landing in
+	 * ONE git commit so `git revert` restores the lesson exactly (自动写资产
+	 * 必须可回滚). Returns undefined when the slug doesn't exist (idempotent).
+	 */
+	async archiveLesson(
+		slug: string,
+		opts: { message: string },
+	): Promise<{ archivedTo: string; committed: boolean } | undefined> {
+		return this.enqueue(async () => {
+			const clean = okf.slugify(slug)
+			const file = this.topicPath(clean)
+			if (!(await existsSync(file))) return undefined
+			const stamp = new Date().toISOString().replace(/[:.]/g, "-")
+			const archivedTo = `archive/lessons/${clean}-${stamp}.md`
+			const absTo = join(this.root, archivedTo)
+			await mkdir(dirname(absTo), { recursive: true })
+			await copyFile(file, absTo)
+			await rm(file)
+			await this.regenerateIndex()
+			const committed = await this.commit(
+				[archivedTo, `topics/${clean}.md`, "index.md"],
+				opts.message,
+			)
+			return { archivedTo, committed }
+		})
+	}
+
 	private async regenerateIndex(): Promise<void> {
 		const metas = await this.listTopics()
 		const entries: okf.IndexEntry[] = metas.map((m) => ({
@@ -375,7 +502,10 @@ export class BundleStore {
 			tags: m.tags,
 		}))
 		await atomicWrite(join(this.root, "index.md"), okf.renderIndex(entries))
-		await atomicWrite(join(this.metaDir(), "backlinks.json"), `${JSON.stringify(await this.computeBacklinks(), null, 2)}\n`)
+		await atomicWrite(
+			join(this.metaDir(), "backlinks.json"),
+			`${JSON.stringify(await this.computeBacklinks(), null, 2)}\n`,
+		)
 	}
 
 	/**
@@ -383,12 +513,15 @@ export class BundleStore {
 	 * edges + body links). Regenerated on every topic write (dsh ADR 0003
 	 * write-through), so it never drifts from the files.
 	 */
-	private async computeBacklinks(): Promise<Record<string, { slug: string; via: "depends" | "link" }[]>> {
+	private async computeBacklinks(): Promise<
+		Record<string, { slug: string; via: "depends" | "link" }[]>
+	> {
 		const backlinks: Record<string, { slug: string; via: "depends" | "link" }[]> = {}
 		const push = (target: string, from: string, via: "depends" | "link"): void => {
 			if (target === from) return
 			const list = backlinks[target] ?? []
-			if (!list.some((e) => e.slug === from && e.via === via)) list.push({ slug: from, via })
+			if (!list.some((e) => e.slug === from && e.via === via))
+				list.push({ slug: from, via })
 			backlinks[target] = list
 		}
 		let files: string[]
@@ -412,7 +545,9 @@ export class BundleStore {
 	}
 
 	/** Read the generated backlinks index (empty map when absent). */
-	async readBacklinks(): Promise<Record<string, { slug: string; via: "depends" | "link" }[]>> {
+	async readBacklinks(): Promise<
+		Record<string, { slug: string; via: "depends" | "link" }[]>
+	> {
 		try {
 			const raw = await readFile(join(this.metaDir(), "backlinks.json"), "utf8")
 			const parsed: unknown = JSON.parse(raw)
@@ -431,9 +566,10 @@ export class BundleStore {
 
 	async appendObservation(input: {
 		kind: ObservationKind
-		source: "model" | "auto"
+		source: ObservationSource
 		text: string
 		sessionId?: string
+		by?: string
 	}): Promise<Observation> {
 		const obs: Observation = {
 			id: `obs-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`,
@@ -444,6 +580,7 @@ export class BundleStore {
 			distilled: false,
 		}
 		if (input.sessionId !== undefined) obs.sessionId = input.sessionId
+		if (input.by !== undefined) obs.by = input.by
 		// Behind the store-wide queue: markDistilled / recordUnconsumed rewrite
 		// the whole JSONL file — an unsynchronized append here could interleave
 		// with a rewrite and lose either the new observation or the rewrite.
@@ -477,7 +614,10 @@ export class BundleStore {
 		return (await this.allObservations(2000)).filter((o) => !o.distilled).slice(-limit)
 	}
 
-	async markDistilled(ids: readonly string[], intoSlugs: readonly string[]): Promise<number> {
+	async markDistilled(
+		ids: readonly string[],
+		intoSlugs: readonly string[],
+	): Promise<number> {
 		return this.enqueue(async () => {
 			const all = await this.allObservations(2000)
 			const idSet = new Set(ids)
@@ -490,8 +630,14 @@ export class BundleStore {
 				}
 			}
 			if (changed > 0) {
-				await atomicWrite(this.observationsPath(), all.map((o) => `${JSON.stringify(o)}\n`).join(""))
-				await this.commit(["meta/observations.jsonl"], `topics(meta): distill ${ids.length} observation(s) into ${intoSlugs.join(", ")}`)
+				await atomicWrite(
+					this.observationsPath(),
+					all.map((o) => `${JSON.stringify(o)}\n`).join(""),
+				)
+				await this.commit(
+					["meta/observations.jsonl"],
+					`topics(meta): distill ${ids.length} observation(s) into ${intoSlugs.join(", ")}`,
+				)
 			}
 			return changed
 		})
@@ -515,7 +661,10 @@ export class BundleStore {
 	 * usual flush cadence; a deletion commits immediately — destroying data
 	 * must be traceable in git.
 	 */
-	async recordUnconsumed(fedIds: readonly string[], consumedIds: readonly string[]): Promise<{ dropped: number }> {
+	async recordUnconsumed(
+		fedIds: readonly string[],
+		consumedIds: readonly string[],
+	): Promise<{ dropped: number }> {
 		return this.enqueue(async () => {
 			const all = await this.allObservations(2000)
 			const fed = new Set(fedIds)
@@ -535,10 +684,16 @@ export class BundleStore {
 				kept.push(o)
 			}
 			if (changed > 0 || dropped > 0) {
-				await atomicWrite(this.observationsPath(), kept.map((o) => `${JSON.stringify(o)}\n`).join(""))
+				await atomicWrite(
+					this.observationsPath(),
+					kept.map((o) => `${JSON.stringify(o)}\n`).join(""),
+				)
 			}
 			if (dropped > 0) {
-				await this.commit(["meta/observations.jsonl"], `topics(meta): gc ${dropped} unprocessable observation(s)`)
+				await this.commit(
+					["meta/observations.jsonl"],
+					`topics(meta): gc ${dropped} unprocessable observation(s)`,
+				)
 			}
 			return { dropped }
 		})
@@ -565,8 +720,16 @@ export class BundleStore {
 		// ~512KB cap; keep the most recent quarter when exceeded (headroom for
 		// the next debounce window before the next compaction).
 		if (size <= 512 * 1024) return
-		const lines = (await readFile(file, "utf8")).split("\n").filter((l) => l.trim() !== "")
-		await atomicWrite(file, lines.slice(-Math.max(1, Math.floor(lines.length / 4))).map((l) => `${l}\n`).join(""))
+		const lines = (await readFile(file, "utf8"))
+			.split("\n")
+			.filter((l) => l.trim() !== "")
+		await atomicWrite(
+			file,
+			lines
+				.slice(-Math.max(1, Math.floor(lines.length / 4)))
+				.map((l) => `${l}\n`)
+				.join(""),
+		)
 	}
 
 	async readInjectionRecords(limit = 2000): Promise<InjectionRecord[]> {
@@ -590,15 +753,15 @@ export class BundleStore {
 
 	// ------------------------------------------------------------------
 	// Pointer-open log (v4 §4.3) — one line per topic_open call; feeds the
-	// pointer-open-rate stat. Features only (slug/time), never conversation
-	// text.
+	// pointer-open-rate stat. Features only (slug/time + attribution), never
+	// conversation text.
 	// ------------------------------------------------------------------
 
 	private opensPath(): string {
 		return join(this.metaDir(), "opens.jsonl")
 	}
 
-	async appendOpenRecord(record: { slug: string; at: string; sessionId?: string }): Promise<void> {
+	async appendOpenRecord(record: OpenRecord): Promise<void> {
 		await mkdir(this.metaDir(), { recursive: true })
 		await appendFile(this.opensPath(), `${JSON.stringify(record)}\n`, "utf8")
 		await this.compactOpensIfNeeded()
@@ -613,26 +776,48 @@ export class BundleStore {
 			return
 		}
 		if (size <= 512 * 1024) return
-		const lines = (await readFile(file, "utf8")).split("\n").filter((l) => l.trim() !== "")
-		await atomicWrite(file, lines.slice(-Math.max(1, Math.floor(lines.length / 4))).map((l) => `${l}\n`).join(""))
+		const lines = (await readFile(file, "utf8"))
+			.split("\n")
+			.filter((l) => l.trim() !== "")
+		await atomicWrite(
+			file,
+			lines
+				.slice(-Math.max(1, Math.floor(lines.length / 4)))
+				.map((l) => `${l}\n`)
+				.join(""),
+		)
 	}
 
-	/** Opens in the recent window; tolerant of a torn tail like the other JSONLs. */
-	async readOpenRecords(limit = 2000): Promise<{ slug: string; at: string; sessionId?: string }[]> {
+	/** Opens in the recent window; tolerant of a torn tail like the other JSONLs.
+	 *  Enrichment fields (sessionId/source/score/sinceInjectionMs) are optional:
+	 *  pre-enrichment lines carry only slug/at and read back without them. */
+	async readOpenRecords(limit = 2000): Promise<OpenRecord[]> {
 		let raw: string
 		try {
 			raw = await readFile(this.opensPath(), "utf8")
 		} catch {
 			return []
 		}
-		const out: { slug: string; at: string; sessionId?: string }[] = []
+		const out: OpenRecord[] = []
 		for (const line of raw.split("\n")) {
 			if (line.trim() === "") continue
 			try {
-				const parsed = JSON.parse(line) as { slug?: unknown; at?: unknown; sessionId?: unknown }
+				const parsed = JSON.parse(line) as {
+					slug?: unknown
+					at?: unknown
+					sessionId?: unknown
+					source?: unknown
+					score?: unknown
+					sinceInjectionMs?: unknown
+				}
 				if (typeof parsed.slug === "string" && typeof parsed.at === "string") {
-					const rec: { slug: string; at: string; sessionId?: string } = { slug: parsed.slug, at: parsed.at }
+					const rec: OpenRecord = { slug: parsed.slug, at: parsed.at }
 					if (typeof parsed.sessionId === "string") rec.sessionId = parsed.sessionId
+					if (parsed.source === "pointer" || parsed.source === "search")
+						rec.source = parsed.source
+					if (typeof parsed.score === "number") rec.score = parsed.score
+					if (typeof parsed.sinceInjectionMs === "number")
+						rec.sinceInjectionMs = parsed.sinceInjectionMs
 					out.push(rec)
 				}
 			} catch {
@@ -650,7 +835,12 @@ export class BundleStore {
 		try {
 			const raw = await readFile(this.conflictsPath(), "utf8")
 			const parsed: unknown = JSON.parse(raw)
-			if (Array.isArray(parsed)) return new Set(parsed.filter((x): x is string => typeof x === "string").map((p) => okf.pathToSlug(p)))
+			if (Array.isArray(parsed))
+				return new Set(
+					parsed
+						.filter((x): x is string => typeof x === "string")
+						.map((p) => okf.pathToSlug(p)),
+				)
 		} catch {
 			// absent = no conflicts
 		}
@@ -662,7 +852,12 @@ export class BundleStore {
 		try {
 			const raw = readFileSync(this.conflictsPath(), "utf8")
 			const parsed: unknown = JSON.parse(raw)
-			if (Array.isArray(parsed)) return new Set(parsed.filter((x): x is string => typeof x === "string").map((p) => okf.pathToSlug(p)))
+			if (Array.isArray(parsed))
+				return new Set(
+					parsed
+						.filter((x): x is string => typeof x === "string")
+						.map((p) => okf.pathToSlug(p)),
+				)
 		} catch {
 			// absent = no conflicts
 		}
@@ -682,7 +877,10 @@ export class BundleStore {
 			} else {
 				await atomicWrite(this.conflictsPath(), `${JSON.stringify(topics, null, 2)}\n`)
 			}
-			await this.commit(["meta/conflicts.json"], `topics(meta): mark ${topics.length} conflicted topic(s)`)
+			await this.commit(
+				["meta/conflicts.json"],
+				`topics(meta): mark ${topics.length} conflicted topic(s)`,
+			)
 		})
 	}
 
@@ -702,11 +900,17 @@ export class BundleStore {
 		head?: string
 	}> {
 		const metas = await this.listTopics()
-		const byStatus: Record<okf.TopicStatus, number> = { draft: 0, stable: 0, deprecated: 0 }
+		const byStatus: Record<okf.TopicStatus, number> = {
+			draft: 0,
+			stable: 0,
+			deprecated: 0,
+		}
 		for (const m of metas) byStatus[m.status] += 1
 		const obs = await this.allObservations(2000)
 		const conflicts = [...(await this.getConflicts())]
-		const head = this.gitDisabled ? undefined : await gitmod.headRev(this.root).catch(() => undefined)
+		const head = this.gitDisabled
+			? undefined
+			: await gitmod.headRev(this.root).catch(() => undefined)
 		return {
 			root: this.root,
 			topicCount: metas.length,

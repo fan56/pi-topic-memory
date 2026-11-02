@@ -90,6 +90,18 @@ pi install npm:@aiwayds/pi-topic-memory
 | `consolidateCadence` | `daily` | 整理 lane 节拍：`daily`/`3d`/`7d`/`off` |
 | `deprecatedTtlDays` | `15` | deprecated 条目 N 天后自动删除（0 关闭；git 可找回） |
 | `usageBoost` | `0.15` | 近 30 天被注入/打开过的 Topic 检索加分（0 关闭） |
+| `zeroOpenDecay` | `false` | 零打开衰减：注入 ≥5 次/30 天且从未被打开的 Topic 命中分 ×0.5 |
+| `embeddingProvider` | 空（语义层关） | 本地语义重排 provider，仅 `ollama`（重排 0.20–0.30 near-floor 带） |
+| `embeddingModel` | 空（provider 默认） | embedding 模型（ollama 默认 nomic-embed-text） |
+| `packageMode` | `off` | 三层信息包总闸：`off`/`shadow`（旁路账不落上下文）/`on`；承载 query 清洗+三层包+语义重排 |
+| `lessonInject` | `off` | lesson 注入闸：`off`/`shadow`（落 lesson-shadow.jsonl）/`on`（established lesson 注入） |
+| `jevEnabled` | `false` | System One 决策层总闸（jev 批量 noul 门控；快道硬守卫，关=零外呼） |
+| `jevBackend` | `zen` | jev 后端：`zen`/`native`/`openrouter` |
+| `jevModel` | 空（后端默认） | jev 模型钉版 id |
+| `jevTimeoutMs` | `3000` | jev 单请求超时（无重试，fail-open 硬编码） |
+| `jevSecretFile` | 空 | 出网 secret gate 外部清单路径（热换） |
+| `jevLayaFallback` | `false` | laya 本地陪跑（纯遥测对照，永不接管决策） |
+| `jevLayaUrl` | `http://127.0.0.1:8000/v1/systemone` | laya-serve 端点 |
 | `pushDebounceSeconds` | `45` | GitHub 模式去抖推送间隔 |
 
 ## 已知边界

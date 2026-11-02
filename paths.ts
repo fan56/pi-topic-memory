@@ -15,6 +15,7 @@
  * @module paths
  */
 
+import { createHash } from "node:crypto"
 import { homedir, hostname as osHostname } from "node:os"
 import { dirname, join } from "node:path"
 
@@ -75,4 +76,17 @@ export function hostId(): string {
 /** The actor string stamped into `generated.by` for machine-written topics. */
 export function actorFor(): string {
 	return `agent:pi-topic-memory@${hostId()}`
+}
+
+/**
+ * The workspace identity the lesson scope filter compares against. Override
+ * with $PI_TOPICS_WORKSPACE_ID (tests / multi-root hosts; the override also
+ * lets a host pin one identity across chdirs). Mirrors dsh: the cwd hash at
+ * read time is the minimal viable source — the same derivation the lesson
+ * write path stamps into frontmatter.workspaceId, so no config plumbing.
+ */
+export function currentWorkspaceId(): string {
+	const env = process.env.PI_TOPICS_WORKSPACE_ID?.trim()
+	if (env !== undefined && env !== "") return env
+	return createHash("sha256").update(process.cwd()).digest("hex").slice(0, 16)
 }

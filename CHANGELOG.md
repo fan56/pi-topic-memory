@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.5.1
+
+- **Housekeeping**: pi SDK devDependencies exact-pinned 1.2.0 -> 1.5.0
+  (pi-ai / pi-coding-agent / pi-tui), the nested lockfile closure
+  following at 1.5.0. No behavior change: pi 1.5.0's tool-argument
+  validation switch (TypeBox -> pi-schema) does not touch this plugin —
+  the topic_* tools register plain Type.Object schemas from the
+  host-provided "typebox" package, which pi 1.5.0 validates as plain
+  JSON Schema.
+
 ## 0.5.0
 
 Full parity sync with dsh-topics-memory v0.25.1 (the 2026-09-14 v0.16.0-era

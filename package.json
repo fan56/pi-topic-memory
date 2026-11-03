@@ -1,6 +1,6 @@
 {
   "name": "@aiwayds/pi-topic-memory",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "OKF v0.2 topic memory for the pi coding agent: a local git-tracked knowledge bundle (~/.pi/agent/topics) with observe -> distill -> consolidate lanes, zero-LLM hot-path injection (pointer/digest, budgeted), five topic_* model tools, and the /topics command family. Ported from the author's dsh-topics-memory.",
   "type": "module",
   "license": "Apache-2.0",
